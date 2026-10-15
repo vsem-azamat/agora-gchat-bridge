@@ -4,7 +4,7 @@
 
 The bridge is one process per bridged space. It reaches Google Chat through the Chat REST API with your user credentials (`chat_api.ChatApi`), and the People API for names.
 
-The Agora hub starts the bridge, writes `hello` and `out` lines to its standard input and reads `hello`, `in`, `sent` and `failed` lines from its standard output; its standard error goes to the hub's log.
+The Agora hub starts the bridge, writes `hello` and `out` lines to its standard input and reads `hello`, `in`, `avatar`, `sent` and `failed` lines from its standard output; its standard error goes to the hub's log.
 
 | Module | Holds |
 | --- | --- |
@@ -16,6 +16,7 @@ The Agora hub starts the bridge, writes `hello` and `out` lines to its standard 
 | `errors.py` | Errors, sorted by what the bridge does about them |
 | `bridge.py` | The bridge itself: cursor, reading, threads, send jobs |
 | `render.py` | A Chat message to the text and fields of an `in` line |
+| `outgoing.py` | An agent's text to Chat's: Markdown to Chat's formatting, `@names` to mentions |
 | `text.py` | UTF-16 lengths, splitting, the agent's name in front of a message |
 
 ## Start
@@ -34,13 +35,19 @@ Chat sends no events to user credentials, so the bridge reads the space every `-
 Each message becomes an `in` line:
 
 - `id`: the message's id in the space (the last part of `spaces/S/messages/ID`), and `cursor`;
-- `author`: `id` (the numeric user id), `name` (the People API's display name, cached for 24 h; `user <id>` when the directory does not know them), `self` for the account's own messages written in Chat. An app's message carries its display name, else `app`;
+- `author`: `id` (the numeric user id), `name` (the People API's display name, cached for 24 h; `user <id>` when the directory does not know them), `self` for the account's own messages written in Chat, and `avatar_rev` (see [Avatars](#avatars)). An app's message carries its display name, else `app`;
 - `text`: the text, with `<users/ID>` markup as `@Name` and `<url|text>` links as `text (url)`; attachments, GIFs and cards as placeholders in front (`[image a.png]`, `[file doc.pdf]`, `[Drive file …]`, `[GIF]`, `[card] <fallback text>`);
 - `at`: the creation time;
 - `reply_to`: the quoted message, when the message quotes one of this space;
 - `addressed`: in a direct message every message but the account's own; in a space a mention of the account or `@all`, or a reply in a thread the account started (see Threads).
 
 An own message that starts with the prefix is not the operator's: it comes in from the author `assistant (<prefix>)` with `self: false` and is not addressed. The bridge's own messages (see Sending) only move the cursor.
+
+## Avatars
+
+The People API names each person's profile photo. When it does, the `in` line's author carries `avatar_rev`: 16 hex digits of a hash of the photo's address without its size, or `none` for a person whose photo is Google's default. A person the directory does not know, or whose record could not be read, gets no `avatar_rev`: the bridge does not know whether they have a photo. The first time a process sees a person with a rev, it writes an `avatar` line for them: the photo at 160 px (`AVATAR_SIZE`, the size Google serves on request) in base64 with its `mime`, or empty `data` for `none`. The account's own messages and assistants' messages carry no avatar: the hub shows them as the operator's or an assistant's.
+
+Avatar lines are written by their own loop, outside the space lock, at most 30 in any 65 s (`AVATAR_LINES`, `AVATAR_WINDOW_SECONDS`; the hub drops more than 30 a minute); the others wait their turn, oldest first, also across a reconnect. A download that gets no answer goes to the back of the queue and the loop pauses for 30 s (`AVATAR_RETRY_SECONDS`). A photo Google refuses, or one that is not a JPEG or PNG of at most 256 KiB, is logged and skipped until the person's photo changes; it is never reported as `none`.
 
 ## Threads
 
@@ -50,7 +57,9 @@ An `out` line goes into a thread when it names one: its `thread` key, else its `
 
 ## Sending
 
-Each `out` line becomes a send job: one message per part, as plain text starting with the prefix. When the line's author is an agent (any `kind` but `human`), every part names it after the prefix: `🤖 secretary: …`, from the author's `display` (else `name`), on one line and cut to 32 UTF-16 units (`MAX_PERSONA_UTF16`). The operator's messages carry the prefix alone. Text over 3998 UTF-16 units (`MAX_MESSAGE_UTF16`: Chat's 4096 characters less the longest prefix, name and `: `) is split at line breaks or spaces into several messages, each with the prefix and the name.
+Each `out` line becomes a send job: one message per part, as plain text starting with the prefix.
+
+Before it is split, the text is put into Chat's own markup (`outgoing.py`), outside code spans and blocks: `**bold**` and Markdown headings become `*bold*`, `*italic*` becomes `_italic_`, `~~struck~~` becomes `~struck~`, and `[text](url)` becomes `<url|text>`. `@Name` becomes a Chat mention (`<users/ID>`) when the name is a member's: the space's human members are read (`spaces.members.list`) with their People API names at most every 10 minutes (`MEMBERS_TTL_SECONDS`), and each can be mentioned by their full name, or by their first name when no other member has it; a full name two members share mentions neither. Names are compared without case and must end at a word boundary; longer names win (`@Ada Lovelace` over `@Ada`). Any other `@word` stays text. When the members cannot be read, the last known ones are used. When the line's author is an agent (any `kind` but `human`), every part names it after the prefix: `🤖 secretary: …`, from the author's `display` (else `name`), on one line and cut to 32 UTF-16 units (`MAX_PERSONA_UTF16`). The operator's messages carry the prefix alone. Text over 3998 UTF-16 units (`MAX_MESSAGE_UTF16`: Chat's 4096 characters less the longest prefix, name and `: `) is split at line breaks or spaces into several messages, each with the prefix and the name.
 
 Every part carries a client-assigned message id, `client-ag-<h>-<out id>-<part>`, where `<h>` is 8 hex digits of a hash of the bridge's name and the space. The bridge answers `sent` with the first part's message id before any read can see it: reads and sends share one lock. An `out` id handed twice in one process is sent once. A refused send answers `failed` with Google's reason; when a later part fails, the reason says `sent in part: N of M`.
 

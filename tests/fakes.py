@@ -35,6 +35,12 @@ class FakeChat:
         self.person_errors: list[Exception] = []  # raised by the next get_person calls
         self.thread_list_errors: list[Exception] = []  # raised by thread lookups
         self.create_delay = 0.005  # a create yields, as a request would
+        self.members = [ME, "users/200", "users/300"]
+        self.member_reads = 0
+        self.person_reads: list[str] = []
+        self.photos: dict[str, str] = {}  # user → photo URL (none: a default photo)
+        self.images: dict[str, Any] = {}  # URL → bytes, an exception or a list of them
+        self.downloads: list[str] = []
 
     # --- test helpers -------------------------------------------------------
 
@@ -155,8 +161,32 @@ class FakeChat:
     async def get_person(self, user: str) -> dict[str, Any] | None:
         if self.person_errors:
             raise self.person_errors.pop(0)
+        self.person_reads.append(user)
         name = self.people.get(user)
-        return {"names": [{"displayName": name}]} if name else None
+        if not name:
+            return None
+        photo = self.photos.get(user)
+        photos = (
+            [{"url": photo, "metadata": {"primary": True}}]
+            if photo
+            else [{"url": "https://example.com/default=s100", "default": True}]
+        )
+        return {"names": [{"displayName": name}], "photos": photos}
+
+    async def list_members(self, space: str) -> list[dict[str, Any]]:
+        self.member_reads += 1
+        return [{"member": {"name": user, "type": "HUMAN"}} for user in self.members]
+
+    async def download(self, url: str) -> bytes:
+        self.downloads.append(url)
+        answer = self.images.get(url)
+        if isinstance(answer, list):
+            answer = answer.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        if answer is None:
+            raise ApiError(404, "no such image")
+        return answer
 
 
 def api_error(status: int, message: str = "refused") -> ApiError:

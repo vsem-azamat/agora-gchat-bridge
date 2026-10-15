@@ -176,3 +176,28 @@ def test_token_file_errors(tmp_path):
     bad.write_text(json.dumps({"client_id": "x"}))
     with pytest.raises(ConfigError, match="client_secret"):
         load_token_file(bad)
+
+
+async def test_members_are_read_across_pages(api, google):
+    google.chat += [
+        httpx.Response(200, json={"memberships": [{"name": "a"}], "nextPageToken": "p2"}),
+        httpx.Response(200, json={"memberships": [{"name": "b"}]}),
+    ]
+    assert [m["name"] for m in await api.list_members(SPACE)] == ["a", "b"]
+    assert google.chat_requests()[1].url.params["pageToken"] == "p2"
+
+
+async def test_person_asks_for_names_and_photos(api, google):
+    google.chat.append(httpx.Response(200, json={"names": []}))
+    await api.get_person("users/5")
+    assert google.chat_requests()[0].url.params["personFields"] == "names,photos"
+
+
+async def test_download(api, google):
+    google.chat += [httpx.Response(200, content=b"img"), error(403, "no"), error(503, "busy")]
+    assert await api.download("https://example.com/p=s160") == b"img"
+    with pytest.raises(ApiError):
+        await api.download("https://example.com/p=s160")
+    with pytest.raises(TransportError):
+        await api.download("https://example.com/p=s160")
+    assert "Authorization" not in google.chat_requests()[0].headers

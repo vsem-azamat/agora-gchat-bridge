@@ -24,7 +24,8 @@ REQUEST_TIMEOUT_SECONDS = 30.0
 MAX_RETRIES = 3
 MAX_BACKOFF_SECONDS = 30.0
 PAGE_SIZE = 100  # messages per page (Chat allows up to 1000; reads after a cursor are short)
-SPACES_PAGE_SIZE = 1000  # Chat's largest page of spaces
+SPACES_PAGE_SIZE = 1000  # Chat's largest page of spaces and of members
+MAX_DOWNLOAD_BYTES = 1024 * 1024
 
 
 class ChatApi:
@@ -65,6 +66,19 @@ class ChatApi:
             token = data.get("nextPageToken") or None
             if not token:
                 return spaces
+
+    async def list_members(self, space: str) -> list[dict[str, Any]]:
+        members: list[dict[str, Any]] = []
+        token: str | None = None
+        while True:
+            params = {"pageSize": str(SPACES_PAGE_SIZE)}
+            if token:
+                params["pageToken"] = token
+            data = await self._request("GET", f"{self._chat}/{space}/members", params=params)
+            members.extend(m for m in data.get("memberships") or [] if isinstance(m, dict))
+            token = data.get("nextPageToken") or None
+            if not token:
+                return members
 
     # --- messages ---------------------------------------------------------
 
@@ -133,17 +147,31 @@ class ChatApi:
     # --- people -----------------------------------------------------------
 
     async def get_person(self, user: str) -> dict[str, Any] | None:
-        """The name of a Chat user (users/{id}) from the People API; None
+        """The name and photo of a Chat user (users/{id}) from the People API; None
         when the directory does not know them."""
         resource = "people/" + user.removeprefix("users/")
         try:
             return await self._request(
-                "GET", f"{self._people}/{resource}", params={"personFields": "names"}
+                "GET", f"{self._people}/{resource}", params={"personFields": "names,photos"}
             )
         except ApiError as exc:
             if exc.status in (403, 404):
                 return None
             raise
+
+    async def download(self, url: str) -> bytes:
+        """A public image (a profile photo), at most MAX_DOWNLOAD_BYTES."""
+        try:
+            resp = await self._http.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+        except httpx.HTTPError as exc:
+            raise TransportError(f"download: {type(exc).__name__}") from exc
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise TransportError(f"download: HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            raise ApiError(resp.status_code, "download refused")
+        if len(resp.content) > MAX_DOWNLOAD_BYTES:
+            raise ApiError(413, "download too large")
+        return resp.content
 
     # --- transport --------------------------------------------------------
 

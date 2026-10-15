@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 
 from gchat_bridge.bridge import MAX_MESSAGE_UTF16, PROTOCOL_VERSION, Bridge, Cursor
-from gchat_bridge.errors import ConfigError, TransportError
+from gchat_bridge.errors import ApiError, ConfigError, TransportError
 from gchat_bridge.render import format_time
 from tests.fakes import ME, SPACE, T0, FakeChat, api_error
 
@@ -147,7 +147,7 @@ async def test_incoming_message_line(chat):
     await h.until(lambda: h.ins())
     line = h.ins()[0]
     assert line["id"] == "m1"
-    assert line["author"] == {"id": "200", "name": "Ada", "self": False}
+    assert line["author"] == {"id": "200", "name": "Ada", "self": False, "avatar_rev": "none"}
     assert line["text"] == "hello there"
     assert line["addressed"] is False
     assert line["at"] == "2026-10-10T18:00:01Z"
@@ -190,7 +190,7 @@ async def test_operator_message_is_self_and_prefixed_one_is_an_assistant(chat):
     chat.add("from my phone", sender=ME)
     chat.add("🤖 other: from another client", sender=ME)
     await h.until(lambda: len(h.ins()) == 2)
-    assert h.ins()[0]["author"] == {"id": "100", "name": "Operator", "self": True}
+    assert h.ins()[0]["author"] == {"id": "100", "name": "Operator", "self": True}  # no avatar
     assert h.ins()[1]["author"] == {"id": "assistant", "name": "assistant (🤖)", "self": False}
     assert h.ins()[1]["addressed"] is False
     await h.stop()
@@ -593,3 +593,130 @@ async def test_losing_access_after_a_reconnect_is_a_configuration_error(chat):
     h.start()  # the reconnect reads first
     with pytest.raises(ConfigError):
         await asyncio.wait_for(h.task, 2)
+
+
+# --- mentions and formatting out ---------------------------------------------
+
+
+async def test_names_of_members_become_mentions(chat):
+    chat.people["users/300"] = "Grace Hopper"
+    h = await started(chat)
+    h.out(20, "@Ada and @Grace Hopper, see **this**; @Nobody stays; `@Ada` in code stays")
+    await h.until(lambda: h.of("sent"))
+    assert chat.texts() == [
+        "🤖 secretary: <users/200> and <users/300>, see *this*; @Nobody stays; `@Ada` in code stays"
+    ]
+    await h.stop()
+
+
+async def test_members_are_read_again_after_a_while(chat, monkeypatch):
+    h = await started(chat)
+    h.out(21, "@Ada")
+    await h.until(lambda: h.of("sent"))
+    h.out(22, "@Ada")
+    await h.until(lambda: len(h.of("sent")) == 2)
+    assert chat.member_reads == 1
+    monkeypatch.setattr("gchat_bridge.bridge.MEMBERS_TTL_SECONDS", 0.0)
+    h.out(23, "@Ada")
+    await h.until(lambda: len(h.of("sent")) == 3)
+    assert chat.member_reads == 2
+    await h.stop()
+
+
+async def test_members_that_cannot_be_read_leave_the_text_as_it_is(chat):
+    async def refuse(space):
+        raise ApiError(403, "no")
+
+    chat.list_members = refuse
+    h = await started(chat)
+    h.out(24, "@Ada hi")
+    await h.until(lambda: h.of("sent"))
+    assert chat.texts() == ["🤖 secretary: @Ada hi"]
+    await h.stop()
+
+
+# --- avatars ------------------------------------------------------------------
+
+JPEG = b"\xff\xd8\xff" + b"0" * 100
+PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+
+
+async def test_avatar_line_for_a_person_with_a_photo(chat):
+    chat.photos["users/200"] = "https://example.com/ada=s100"
+    chat.images["https://example.com/ada=s160"] = JPEG
+    h = await started(chat)
+    chat.add("hi")
+    chat.add("again")
+    await h.until(lambda: h.of("avatar"))
+    rev = h.ins()[0]["author"]["avatar_rev"]
+    assert rev not in ("", "none")
+    avatar = h.of("avatar")[0]
+    assert avatar["author"] == "200" and avatar["rev"] == rev and avatar["mime"] == "image/jpeg"
+    assert avatar["data"] and len(h.of("avatar")) == 1
+    await h.stop()
+
+
+async def test_person_without_a_photo_gets_an_empty_avatar(chat):
+    h = await started(chat)
+    chat.add("hi")
+    await h.until(lambda: h.of("avatar"))
+    assert h.of("avatar") == [{"type": "avatar", "author": "200", "data": "", "rev": "none"}]
+    await h.stop()
+
+
+async def test_failed_download_is_not_recorded_as_no_photo(chat):
+    chat.photos["users/200"] = "https://example.com/ada=s100"
+    chat.images["https://example.com/ada=s160"] = ApiError(403, "no")
+    h = await started(chat)
+    chat.add("hi")
+    await h.until(lambda: chat.downloads)
+    await asyncio.sleep(0.05)
+    assert h.of("avatar") == []
+    assert h.ins()[0]["author"]["avatar_rev"] != "none"
+    await h.stop()
+
+
+async def test_download_without_an_answer_is_tried_again(chat):
+    chat.photos["users/200"] = "https://example.com/ada=s100"
+    chat.images["https://example.com/ada=s160"] = [TransportError("timeout"), PNG]
+    h = await started(chat, avatar_retry=0.01)
+    chat.add("hi")
+    await h.until(lambda: h.of("avatar"))
+    assert h.of("avatar")[0]["mime"] == "image/png"
+    assert len(chat.downloads) == 2
+    await h.stop()
+
+
+async def test_not_an_image_is_skipped(chat):
+    chat.photos["users/200"] = "https://example.com/ada=s100"
+    chat.images["https://example.com/ada=s160"] = b"<html>"
+    h = await started(chat)
+    chat.add("hi")
+    await h.until(lambda: chat.downloads)
+    await asyncio.sleep(0.05)
+    assert h.of("avatar") == []
+    await h.stop()
+
+
+async def test_unknown_person_has_no_avatar(chat):
+    h = await started(chat)
+    chat.add("hi", sender="users/999")
+    await h.until(lambda: h.ins())
+    assert h.ins()[0]["author"] == {"id": "999", "name": "user 999", "self": False}
+    await asyncio.sleep(0.05)
+    assert h.of("avatar") == []
+    await h.stop()
+
+
+async def test_avatar_lines_keep_within_the_hubs_rate(chat, monkeypatch):
+    monkeypatch.setattr("gchat_bridge.bridge.AVATAR_LINES", 2)
+    for n in range(3):
+        chat.people[f"users/{n}"] = f"P{n}"
+    h = await started(chat, avatar_window=0.3)
+    for n in range(3):
+        chat.add("hi", sender=f"users/{n}")
+    await h.until(lambda: len(h.of("avatar")) == 2)
+    await asyncio.sleep(0.1)
+    assert len(h.of("avatar")) == 2
+    await h.until(lambda: len(h.of("avatar")) == 3, timeout=2)
+    await h.stop()
