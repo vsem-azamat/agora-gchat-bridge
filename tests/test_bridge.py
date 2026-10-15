@@ -540,3 +540,56 @@ async def test_stopping_finishes_the_send_in_flight(chat):
     await h.until(lambda: chat.creates)
     await h.stop()
     assert h.of("sent") == [{"type": "sent", "id": 33, "ext_id": "m1"}]
+
+
+# --- review round 2 -----------------------------------------------------------
+
+
+async def test_quoting_a_later_part_of_a_split_message_gives_way_to_the_root(chat):
+    h = await started(chat)
+    h.out(40, "word " * (MAX_MESSAGE_UTF16 // 2))
+    await h.until(lambda: h.of("sent") and h.bridge.cursor.id == chat.messages[-1]["name"][-2:])
+    first, second = chat.messages[0]["name"], chat.messages[1]["name"]
+    chat.add("about part 2", thread_of="m1", quotedMessageMetadata={"name": second})
+    chat.add("about part 1", thread_of="m1", quotedMessageMetadata={"name": first})
+    await h.until(lambda: len(h.ins()) == 2)
+    assert [line["reply_to"] for line in h.ins()] == ["m1", "m1"]
+    assert all(line["thread"]["key"] == "m1" for line in h.ins())
+    await h.stop()
+
+
+async def test_quoting_a_message_from_before_the_hubs_cursor_keeps_the_quote(chat):
+    chat.add("root")
+    inner = chat.add("inner", thread_of="m1")
+    h = await started(chat, cursor=f"{inner['createTime']}|m2")
+    chat.add("quoting", thread_of="m1", quotedMessageMetadata={"name": f"{SPACE}/messages/m2"})
+    await h.until(lambda: h.ins())
+    assert h.ins()[0]["reply_to"] == "m2"
+    await h.stop()
+
+
+async def test_losing_access_on_the_read_after_a_send_is_a_configuration_error(chat):
+    h = await started(chat)
+    original = chat.create_message
+
+    async def then_refuse(space, text, *, message_id, thread=None):
+        result = await original(space, text, message_id=message_id, thread=thread)
+        chat.list_errors.extend([api_error(403, "no")] * 50)
+        return result
+
+    chat.create_message = then_refuse
+    h.bridge.poll_seconds = 60  # only the read after the send runs
+    h.out(41, "last words")
+    with pytest.raises(ConfigError):
+        await asyncio.wait_for(h.task, 2)
+    assert h.of("sent")
+
+
+async def test_losing_access_after_a_reconnect_is_a_configuration_error(chat):
+    h = await started(chat)
+    chat.list_errors.extend([TransportError("reset")] + [api_error(403, "no")] * 50)
+    with pytest.raises(TransportError):
+        await asyncio.wait_for(h.task, 2)
+    h.start()  # the reconnect reads first
+    with pytest.raises(ConfigError):
+        await asyncio.wait_for(h.task, 2)

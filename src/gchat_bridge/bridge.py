@@ -329,6 +329,12 @@ class Bridge:
         client = msg.get("clientAssignedMessageId")
         return isinstance(client, str) and client.startswith(self.client_prefix)
 
+    def _is_first_part(self, msg: dict[str, Any]) -> bool:
+        """The bridge's own message is a job's first part (`<out id>-0`,
+        perhaps followed by a text hash)."""
+        rest = str(msg.get("clientAssignedMessageId") or "")[len(self.client_prefix) :]
+        return re.fullmatch(r"\d+-0(-[0-9a-f]+)?", rest) is not None
+
     def _is_marked(self, msg: dict[str, Any]) -> bool:
         """The account's own message carrying the prefix: an assistant's."""
         if (msg.get("sender") or {}).get("name") != self.api.user:
@@ -463,8 +469,10 @@ class Bridge:
                 # Build the line first: when that fails (a name or a thread root
                 # that cannot be read), the message stays unseen and the cursor
                 # stays before it, so the next read reports it.
-                line = None if self._is_own(msg) else await self._line_for(msg)
-                self._mark_seen(msg_id)
+                own = self._is_own(msg)
+                line = None if own else await self._line_for(msg)
+                # Of the bridge's own messages the hub has the first part only.
+                self._mark_seen(msg_id, known=not own or self._is_first_part(msg))
                 position = Cursor(at, msg_id)
                 advanced = position > self.cursor
                 if advanced:
@@ -564,7 +572,8 @@ class Bridge:
                 job.thread = started if isinstance(started, str) and started else None
             if isinstance(name, str):
                 job.ids.append(message_id(name))
-                _remember(self._known, message_id(name))
+                if job.done == 0:  # the hub learns the first part's id from `sent`
+                    _remember(self._known, message_id(name))
                 root = self._root_of(msg, message_id(name))
                 if root is not None and not msg.get("threadReply"):
                     root.title = thread_title(msg, {})
@@ -700,6 +709,10 @@ class Bridge:
             return
         try:
             await self._startup()
+        except ApiError as exc:
+            closed.cancel()
+            _raise_lost_access(exc)
+            raise
         except BaseException:
             closed.cancel()
             raise
