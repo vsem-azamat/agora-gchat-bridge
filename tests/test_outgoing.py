@@ -80,3 +80,8 @@ def test_person_without_photos_is_unknown_not_none():
     person = person_from("users/1", {"names": [{"displayName": "Ada"}]})
     assert person.rev == "" and person.named
     assert not person_from("users/1", None).named
+
+
+def test_link_text_with_spaces_and_angle_brackets():
+    assert chat_markup("[two words](https://x.org/)") == "<https://x.org/|two words>"
+    assert chat_markup("[a < b](https://x.org/)") == "[a < b](https://x.org/)"
