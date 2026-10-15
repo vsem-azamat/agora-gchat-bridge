@@ -28,7 +28,6 @@ SCOPES = (
     "https://www.googleapis.com/auth/chat.messages.readonly",
     "https://www.googleapis.com/auth/chat.messages.create",
     "https://www.googleapis.com/auth/chat.spaces.readonly",
-    "https://www.googleapis.com/auth/chat.memberships.readonly",
     "https://www.googleapis.com/auth/directory.readonly",
 )
 EXPIRY_MARGIN_SECONDS = 60.0  # refresh this long before Google's expiry

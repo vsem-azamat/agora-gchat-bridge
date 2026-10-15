@@ -29,7 +29,7 @@ The cursor is the creation time of the last message reported and its id: `2026-1
 
 ## Reading
 
-Chat sends no events to user credentials, so the bridge reads the space every `--poll` seconds (default 5): `spaces.messages.list` filtered on `createTime > …`, oldest first, in pages of 100. Each read starts 10 s before the cursor (`POLL_LOOKBACK`), and one every `--reconcile` seconds (default 60) starts 2 minutes before it (`RECONCILE_LOOKBACK`), so a message that becomes visible after a newer one is still reported. Message ids reported in this process are remembered (the last 5000) and skipped; the hub skips repeats by `ext_id` anyway. A message older than the cursor is reported with the current cursor, so the cursor never moves back. The first read of a process skips what lies before the hub's cursor, which an earlier process reported.
+Chat sends no events to user credentials, so the bridge reads the space every `--poll` seconds (default 5): `spaces.messages.list` filtered on `createTime > …`, oldest first, in pages of 100. Each read starts 10 s before the cursor (`POLL_LOOKBACK`), and one every `--reconcile` seconds (default 60) starts 2 minutes before it (`RECONCILE_LOOKBACK`), so a message that becomes visible after a newer one is still reported. Message ids reported in this process are remembered (the last 5000) and skipped; the hub skips repeats by `ext_id` anyway. A message older than the cursor is reported with the current cursor, so the cursor never moves back. The first read of a process skips what lies before the hub's cursor, which an earlier process reported. A message is marked as reported, and the cursor moved past it, only once its line is built: when building it fails for want of an answer (a name, a thread's root), the read ends there and the next one starts from that message again. A thread root Google refuses to read leaves the reply as a message of the room rather than holding up the messages after it.
 
 Each message becomes an `in` line:
 
@@ -44,9 +44,9 @@ An own message that starts with the prefix is not the operator's: it comes in fr
 
 ## Threads
 
-In a threaded space every top-level message starts a thread (`thread.name`), and replies carry `threadReply`. A thread is keyed in Agora by its root message's id: a reply's `in` line carries `thread: {"key": "<root id>", "title": …}` and `reply_to` the root (unless it quotes another message), so the hub joins it to the root's thread. The root's own line has no `thread`. The title is the first line of the root's text, cut to 80 characters. Roots are remembered as they are read or sent (the last 2000); a reply to an older root reads the thread's first message (`thread.name` filter, one message).
+In a threaded space every top-level message starts a thread (`thread.name`), and replies carry `threadReply`. A thread is keyed in Agora by its root message's id: a reply's `in` line carries `thread: {"key": "<root id>", "title": …}` and `reply_to` the root, so the hub joins it to the root's thread. A reply that quotes another message of the thread replies to that one instead, when the hub has it (it was reported or sent by this process, or lies before the hub's cursor): the hub joins a new key to the thread of the message the line replies to, so a quoted message it does not have would start a new thread. The root's own line has no `thread`. The title is the first line of the root's text, cut to 80 characters. Roots are remembered as they are read or sent (the last 2000); a reply to an older root reads the thread's first message (`thread.name` filter, one message).
 
-An `out` line goes into a thread when it names one: its `thread` key, else its `reply_to`. The bridge finds that message's `thread.name` (remembered, or `spaces.messages.get`) and sends every part with it and `REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`. A reply to a message inside a thread goes into that thread. A thread started in Agora reaches the bridge root first (the hub holds replies until the root has an `ext_id`), so it becomes a thread on the root's message. In a space without threads, replies go out as plain messages.
+An `out` line goes into a thread when it names one: its `thread` key, else its `reply_to`. The bridge finds that message's `thread.name` (remembered, or `spaces.messages.get`) and sends every part with it and `REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`. A message that names no thread starts one with its first part, and every further part goes into that thread, also when the job is resumed after a reconnect. A reply to a message inside a thread goes into that thread. A thread started in Agora reaches the bridge root first (the hub holds replies until the root has an `ext_id`), so it becomes a thread on the root's message. In a space without threads, replies go out as plain messages.
 
 ## Sending
 
@@ -62,7 +62,7 @@ Chat refuses a second message with the same client-assigned id in a space (409 `
 - **Earlier processes.** A message the hub hands again after a restart (the earlier process died before answering) gets the same ids and is claimed the same way. No time window applies.
 - **Stopping.** On `SIGTERM` a send in flight is finished (for up to 4 s; the hub kills the bridge 5 s after `SIGTERM`) before the process exits.
 
-Limit: the ids rest on the hub's message ids. If the hub's database starts over, an id can name a message of the earlier hub; the bridge compares the text of the message it finds with the part, and sends under a fresh id when they differ. A part whose text matches an earlier hub's message with the same id is not sent.
+Limit: the ids rest on the hub's message ids. If the hub's database starts over, an id can name a message of the earlier hub; the bridge compares the text of the message it finds with the part, and when they differ sends under the id with 8 hex digits of a hash of the part's text appended, which is again the same on every attempt. A part whose text matches an earlier hub's message with the same id is not sent.
 
 ## Failures
 
@@ -70,7 +70,7 @@ HTTP 429 and 5xx answers are retried three times with exponential backoff (honou
 
 - no token file, or one without the fields `gchat-bridge login` writes;
 - a refresh token Google refused (revoked access, a deleted OAuth client);
-- a space the account may not read;
-- a space that cannot be read in 6 attempts in a row (`STARTUP_ATTEMPTS`).
+- a space the account may not read (403 or 404), at the start or on any later read;
+- a space that cannot be read in 6 attempts in a row at the start (`STARTUP_ATTEMPTS`).
 
 Logs go to standard error and carry ids and counts, never message text or tokens.

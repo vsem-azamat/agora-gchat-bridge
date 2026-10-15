@@ -22,7 +22,6 @@ import hashlib
 import json
 import logging
 import re
-import secrets
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -65,6 +64,8 @@ MAX_MESSAGE_UTF16 = (
     MAX_TEXT_UTF16 - MAX_PREFIX_UTF16 - MAX_PERSONA_UTF16 - utf16_len(PERSONA_SEPARATOR)
 )
 CLIENT_ID_PREFIX = "client-ag-"  # Chat requires client-assigned ids to start with client-
+CLIENT_ID_HASH_CHARS = 8  # hex digits of the bridge's hash, and of a part's text after a clash
+MAX_ERROR_CHARS = 480  # of a `failed` line's reason; the hub keeps 500
 POLL_LOOKBACK = timedelta(seconds=10)
 RECONCILE_LOOKBACK = timedelta(minutes=2)
 SEEN_LIMIT = 5000  # message ids remembered as reported
@@ -137,9 +138,24 @@ class SendJob:
     out_id: int
     chunks: list[str]
     persona: str = ""
-    root: str | None = None  # the root message whose thread every part goes into
+    root: str | None = None  # the message whose thread every part goes into
+    thread: str | None = None  # that thread, or the one the first part started
     done: int = 0
     ids: list[str] = field(default_factory=list)
+
+
+def _remember(ids: OrderedDict[str, None], msg_id: str) -> None:
+    """Add an id to a bounded set that forgets the oldest first."""
+    ids[msg_id] = None
+    ids.move_to_end(msg_id)
+    while len(ids) > SEEN_LIMIT:
+        ids.popitem(last=False)
+
+
+def _raise_lost_access(exc: ApiError) -> None:
+    """A space the account may no longer read is a configuration error."""
+    if exc.status in (403, 404):
+        raise ConfigError(f"cannot read the space: {short_reason(exc)}") from exc
 
 
 def _parse_id(value: Any) -> int | None:
@@ -158,6 +174,12 @@ def _ext(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text if re.fullmatch(r"[A-Za-z0-9._-]{1,200}", text) else None
+
+
+def _text_hash(text: str) -> str:
+    """A short hash of a part's text, for a client id that stays the same
+    when the part is sent again."""
+    return hashlib.sha256(text.encode()).hexdigest()[:CLIENT_ID_HASH_CHARS]
 
 
 def _same_text(a: str, b: str) -> bool:
@@ -194,6 +216,11 @@ class Bridge:
         self._resolved = False
         self._primed = False
         self._seen: OrderedDict[str, None] = OrderedDict()
+        # Messages the hub has: reported here, sent here, or read before the
+        # hub's cursor (an earlier process reported them). History before an
+        # empty cursor is seen but not the hub's.
+        self._known: OrderedDict[str, None] = OrderedDict()
+        self._history_known = False
         self._roots: OrderedDict[str, Root] = OrderedDict()  # by root message id
         self._thread_roots: OrderedDict[str, str] = OrderedDict()  # thread name → root id
         self._names: dict[str, tuple[str, float]] = {}
@@ -216,7 +243,8 @@ class Bridge:
     def client_prefix(self) -> str:
         """The start of the client-assigned ids of this bridge's messages."""
         name = str((self.hello or {}).get("bridge") or "")
-        digest = hashlib.sha256(f"{name}\n{self.space}".encode()).hexdigest()[:8]
+        digest = hashlib.sha256(f"{name}\n{self.space}".encode()).hexdigest()
+        digest = digest[:CLIENT_ID_HASH_CHARS]
         return f"{CLIENT_ID_PREFIX}{digest}-"
 
     def handle_hub_line(self, raw: str) -> None:
@@ -235,6 +263,7 @@ class Bridge:
             if self.hello is None:
                 self.hello = line
                 self.cursor = Cursor.parse(line.get("cursor"))
+                self._history_known = self.cursor is not None
                 if line.get("cursor") and self.cursor is None:
                     log.warning("hub cursor not understood; starting after the newest message")
                 version = line.get("version")
@@ -256,14 +285,11 @@ class Bridge:
 
     # --- small caches -----------------------------------------------------
 
-    def _mark_seen(self, msg_id: str) -> bool:
-        """Remember a message as reported; False when it already was."""
-        if msg_id in self._seen:
-            return False
-        self._seen[msg_id] = None
-        while len(self._seen) > SEEN_LIMIT:
-            self._seen.popitem(last=False)
-        return True
+    def _mark_seen(self, msg_id: str, *, known: bool = True) -> None:
+        """Remember a message as read, and as the hub's when `known`."""
+        _remember(self._seen, msg_id)
+        if known:
+            _remember(self._known, msg_id)
 
     def _remember_root(self, root: Root) -> None:
         self._roots[root.id] = root
@@ -385,9 +411,19 @@ class Bridge:
             line["reply_to"] = message_id(quoted)
         root = self._root_of(msg, msg_id)
         if self.threaded and msg.get("threadReply") and root is not None:
-            thread_root = await self._thread_root(root.thread)
+            try:
+                thread_root = await self._thread_root(root.thread)
+            except ApiError as exc:
+                # Without its root the reply comes in as the room's, rather than
+                # holding up every message after it.
+                log.warning("root of %s not read: %s", msg_id, short_reason(exc, 120))
+                thread_root = None
             if thread_root is not None and thread_root.id != msg_id:
-                line.setdefault("reply_to", thread_root.id)
+                # The hub joins a new thread key to the thread of the message the
+                # line replies to: a quoted message it may not have would start
+                # a new thread instead.
+                if line.get("reply_to") not in self._known:
+                    line["reply_to"] = thread_root.id
                 line["thread"] = {"key": thread_root.id, "title": thread_root.title}
                 own_root = thread_root.sender == self.api.user and not thread_root.marked
                 if own_root and not (own_account or marked):
@@ -419,22 +455,27 @@ class Bridge:
                 if not isinstance(name, str) or at is None:
                     continue
                 msg_id = message_id(name)
-                if not self._mark_seen(msg_id):
+                if msg_id in self._seen:
                     continue
-                position = Cursor(at, msg_id)
                 if not self._primed and (at < self.cursor.at or msg_id == self.cursor.id):
-                    continue  # reported by an earlier process
+                    self._mark_seen(msg_id, known=self._history_known)
+                    continue  # before the start
+                # Build the line first: when that fails (a name or a thread root
+                # that cannot be read), the message stays unseen and the cursor
+                # stays before it, so the next read reports it.
+                line = None if self._is_own(msg) else await self._line_for(msg)
+                self._mark_seen(msg_id)
+                position = Cursor(at, msg_id)
                 advanced = position > self.cursor
                 if advanced:
                     self.cursor = position
-                if self._is_own(msg):
+                if line is None:
                     root = self._root_of(msg, msg_id)
                     if root is not None and not msg.get("threadReply"):
                         self._remember_root(root)
                     if advanced:
                         self.emit({"type": "in", "cursor": str(self.cursor)})
                     continue
-                line = await self._line_for(msg)
                 line["cursor"] = str(self.cursor)
                 self.emit(line)
                 emitted += 1
@@ -490,13 +531,13 @@ class Bridge:
         """Send what is left of a job and answer it. A connection failure leaves
         the job in place, to be sent again after the reconnect: its parts'
         client-assigned ids make that safe."""
-        thread = None
-        if job.root is not None and self.threaded:
+        if job.thread is None and job.root is not None and self.threaded:
             try:
-                thread = await self._thread_for(job.root)
+                job.thread = await self._thread_for(job.root)
             except ApiError as exc:
                 log.warning("thread of message %s not found: %s", job.out_id, short_reason(exc))
         while job.done < len(job.chunks):
+            thread = job.thread
             text = self._part_text(job, job.done)
             client_id = f"{self.client_prefix}{job.out_id}-{job.done}"
             try:
@@ -510,15 +551,20 @@ class Bridge:
                     msg, new = await self.api.create_message(
                         self.space,
                         text,
-                        message_id=f"{client_id}-{secrets.token_hex(4)}",
+                        message_id=f"{client_id}-{_text_hash(text)}",
                         thread=thread,
                     )
             except ApiError as exc:
                 self._finish_failed(job, short_reason(exc))
                 return
             name = msg.get("name")
+            if self.threaded and job.thread is None:
+                # Every further part goes into the thread the first one started.
+                started = (msg.get("thread") or {}).get("name")
+                job.thread = started if isinstance(started, str) and started else None
             if isinstance(name, str):
                 job.ids.append(message_id(name))
+                _remember(self._known, message_id(name))
                 root = self._root_of(msg, message_id(name))
                 if root is not None and not msg.get("threadReply"):
                     root.title = thread_title(msg, {})
@@ -539,7 +585,7 @@ class Bridge:
     def _finish_failed(self, job: SendJob, reason: str) -> None:
         if job.done:
             reason = f"sent in part: {job.done} of {len(job.chunks)} ({reason})"
-        self.emit({"type": "failed", "id": job.out_id, "error": reason[:480]})
+        self.emit({"type": "failed", "id": job.out_id, "error": reason[:MAX_ERROR_CHARS]})
         self._job = None
         log.warning("message %s not sent (%d of %d parts)", job.out_id, job.done, len(job.chunks))
 
@@ -551,6 +597,7 @@ class Bridge:
             try:
                 await self._read_locked(POLL_LOOKBACK)
             except ApiError as exc:
+                _raise_lost_access(exc)
                 log.warning("read after a send failed: %s", short_reason(exc, 120))
 
     # --- loops ------------------------------------------------------------
@@ -565,6 +612,7 @@ class Bridge:
             try:
                 await self.read(lookback)
             except ApiError as exc:
+                _raise_lost_access(exc)
                 log.warning("read failed: %s", short_reason(exc, 120))
                 await asyncio.sleep(READ_ERROR_PAUSE_SECONDS)
 

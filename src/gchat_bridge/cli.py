@@ -52,6 +52,14 @@ async def read_stdin(bridge: Bridge) -> None:
         bridge.closed.set()
 
 
+async def pause(closed: asyncio.Event, seconds: float) -> None:
+    """Wait before a reconnect, or until the bridge is stopped."""
+    try:
+        await asyncio.wait_for(closed.wait(), timeout=seconds)
+    except TimeoutError:
+        pass
+
+
 async def run(
     config: Config,
     api: Api,
@@ -94,10 +102,7 @@ async def run(
                 )
             if time.monotonic() - started >= STEADY_SECONDS:
                 backoff = backoff_start
-            try:
-                await asyncio.wait_for(bridge.closed.wait(), timeout=backoff)
-            except TimeoutError:
-                pass
+            await pause(bridge.closed, backoff)
             backoff = min(backoff * 2, BACKOFF_MAX)
         return 0
     finally:

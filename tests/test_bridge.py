@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import timedelta
 
 import pytest
 
@@ -270,6 +271,7 @@ async def test_operator_message_carries_the_prefix_alone(chat):
 
 async def test_own_message_only_moves_the_cursor_after_sent(chat):
     h = await started(chat)
+    chat.create_delay = 0.05  # several polls while the answer is on its way
     h.out(7, "hello")
     await h.until(lambda: h.of("sent") and h.lines[-1].get("type") == "in")
     sent_at = h.lines.index(h.of("sent")[0])
@@ -341,6 +343,7 @@ async def test_out_id_handed_twice_is_sent_once(chat):
     await h.until(lambda: h.of("sent"))
     await asyncio.sleep(0.05)
     assert chat.texts() == ["🤖 secretary: once"]
+    assert len(h.of("sent")) == 1 and len(chat.creates) == 1
     await h.stop()
 
 
@@ -413,3 +416,127 @@ async def test_stopping_before_hello_returns(chat):
     h.start()
     await h.stop()
     assert h.lines == []
+
+
+# --- review round 1 -----------------------------------------------------------
+
+
+async def test_message_whose_line_fails_is_read_again(chat):
+    h = await started(chat)
+    chat.person_errors.append(TransportError("People API timeout"))
+    chat.add("first")
+    with pytest.raises(TransportError):
+        await asyncio.wait_for(h.task, 2)
+    assert h.ins() == []
+    h.start()  # the reconnect
+    await h.until(lambda: h.ins())
+    assert [line["text"] for line in h.ins()] == ["first"]
+    await h.stop()
+
+
+async def test_root_that_cannot_be_read_does_not_hold_up_later_messages(chat):
+    chat.add("old root")
+    h = await started(chat)
+    chat.thread_list_errors.append(api_error(400, "bad filter"))
+    chat.add("reply", thread_of="m1")
+    chat.add("next")
+    await h.until(lambda: len(h.ins()) == 2)
+    assert "thread" not in h.ins()[0]
+    assert h.ins()[1]["text"] == "next"
+    await h.stop()
+
+
+async def test_quoted_message_the_hub_lacks_gives_way_to_the_root(chat):
+    chat.add("root")
+    chat.add("before the bridge", thread_of="m1")
+    h = await started(chat)
+    chat.add("quoting", thread_of="m1", quotedMessageMetadata={"name": f"{SPACE}/messages/m2"})
+    await h.until(lambda: h.ins())
+    assert h.ins()[0]["reply_to"] == "m1"
+    await h.stop()
+
+
+async def test_long_top_level_message_keeps_its_parts_in_one_thread(chat):
+    h = await started(chat)
+    h.out(30, "word " * (MAX_MESSAGE_UTF16 // 2))
+    await h.until(lambda: h.of("sent"))
+    assert len(chat.messages) >= 2
+    assert len({m["thread"]["name"] for m in chat.messages}) == 1
+    assert chat.creates[0]["thread"] is None
+    assert all(c["thread"] == chat.messages[0]["thread"]["name"] for c in chat.creates[1:])
+    await h.stop()
+
+
+async def test_resumed_job_keeps_the_first_parts_thread(chat):
+    h = await started(chat)
+    original = chat.create_message
+    calls = []
+
+    async def second_part_breaks(space, text, *, message_id, thread=None):
+        calls.append(message_id)
+        if len(calls) == 2:
+            raise TransportError("timeout")
+        return await original(space, text, message_id=message_id, thread=thread)
+
+    chat.create_message = second_part_breaks
+    h.out(31, "word " * (MAX_MESSAGE_UTF16 // 2))
+    with pytest.raises(TransportError):
+        await asyncio.wait_for(h.task, 2)
+    h.start()  # the reconnect resumes the job at its second part
+    await h.until(lambda: h.of("sent"))
+    assert len(chat.messages) == len({c["message_id"] for c in chat.creates}) == 3
+    assert len({m["thread"]["name"] for m in chat.messages}) == 1
+    await h.stop()
+
+
+async def test_fallback_after_a_taken_id_is_not_sent_twice(chat):
+    h = await started(chat)
+    taken = f"{h.bridge.client_prefix}32-0"
+    chat.add("🤖 old: from an earlier hub", sender=ME, client_id=taken)
+    await h.until(lambda: h.bridge.cursor.id == "m1")
+    chat.lose_answer = 1  # the fallback's create goes through, its answer is lost
+    h.out(32, "new message")
+    with pytest.raises(TransportError):
+        await asyncio.wait_for(h.task, 2)
+    h.start()
+    await h.until(lambda: h.of("sent"))
+    assert chat.texts().count("🤖 secretary: new message") == 1
+    fallbacks = [c["message_id"] for c in chat.creates if c["message_id"] != taken]
+    assert len(fallbacks) == 2 and fallbacks[0] == fallbacks[1]
+    await h.stop()
+
+
+async def test_losing_access_to_the_space_is_a_configuration_error(chat):
+    h = await started(chat)
+    chat.list_errors.append(api_error(403, "The caller does not have permission"))
+    with pytest.raises(ConfigError):
+        await asyncio.wait_for(h.task, 2)
+
+
+async def test_reads_go_across_pages_and_equal_times(chat, monkeypatch):
+    h = await started(chat)
+    original = chat.list_messages
+
+    async def small_pages(space, **kwargs):
+        if not kwargs.get("thread") and not kwargs.get("newest_first"):
+            kwargs["page_size"] = 2
+        return await original(space, **kwargs)
+
+    chat.list_messages = small_pages
+    at = chat.clock + timedelta(seconds=5)
+    for n in range(5):
+        chat.add(f"msg {n}", at=at)
+    await h.until(lambda: len(h.ins()) == 5)
+    assert sorted(line["text"] for line in h.ins()) == [f"msg {n}" for n in range(5)]
+    await asyncio.sleep(0.05)
+    assert len(h.ins()) == 5
+    await h.stop()
+
+
+async def test_stopping_finishes_the_send_in_flight(chat):
+    h = await started(chat)
+    chat.create_delay = 0.2
+    h.out(33, "in flight")
+    await h.until(lambda: chat.creates)
+    await h.stop()
+    assert h.of("sent") == [{"type": "sent", "id": 33, "ext_id": "m1"}]

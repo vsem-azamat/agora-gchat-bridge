@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -30,6 +31,10 @@ class FakeChat:
         self.lose_answer = 0  # creates that succeed but raise TransportError
         self.space_error: Exception | None = None
         self.hidden: set[str] = set()  # names list_messages does not show yet
+        self.list_errors: list[Exception] = []  # raised by the next list_messages calls
+        self.person_errors: list[Exception] = []  # raised by the next get_person calls
+        self.thread_list_errors: list[Exception] = []  # raised by thread lookups
+        self.create_delay = 0.005  # a create yields, as a request would
 
     # --- test helpers -------------------------------------------------------
 
@@ -94,13 +99,17 @@ class FakeChat:
         page_size: int = 100,
         page_token: str | None = None,
     ) -> tuple[list[dict[str, Any]], str | None]:
+        if thread and self.thread_list_errors:
+            raise self.thread_list_errors.pop(0)
+        if not thread and self.list_errors:
+            raise self.list_errors.pop(0)
         found = [m for m in self.messages if m["name"] not in self.hidden]
         if after:
             bound = parse_time(after)
             found = [m for m in found if parse_time(m["createTime"]) > bound]
         if thread:
             found = [m for m in found if m["thread"]["name"] == thread]
-        found.sort(key=lambda m: parse_time(m["createTime"]), reverse=newest_first)
+        found.sort(key=lambda m: (parse_time(m["createTime"]), m["name"]), reverse=newest_first)
         start = int(page_token or 0)
         page = found[start : start + page_size]
         more = start + page_size < len(found)
@@ -136,12 +145,16 @@ class FakeChat:
             "clientAssignedMessageId": message_id,
         }
         self.messages.append(msg)
+        # The message is in the space before its answer arrives.
+        await asyncio.sleep(self.create_delay)
         if self.lose_answer:
             self.lose_answer -= 1
             raise TransportError("ReadTimeout")
         return dict(msg), True
 
     async def get_person(self, user: str) -> dict[str, Any] | None:
+        if self.person_errors:
+            raise self.person_errors.pop(0)
         name = self.people.get(user)
         return {"names": [{"displayName": name}]} if name else None
 

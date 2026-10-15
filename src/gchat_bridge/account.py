@@ -17,6 +17,7 @@ from gchat_bridge.errors import ApiError, AuthError, ConfigError, TransportError
 
 CLIENT_SECRET_ENV = "GCHAT_BRIDGE_CLIENT_SECRET"
 MANUAL_PORT = 8765  # --manual: a loopback address nothing listens on
+PROFILE_TIMEOUT_SECONDS = 15.0
 
 
 def _parser(command: str, argv: list[str]) -> argparse.Namespace:
@@ -80,7 +81,7 @@ def login(args: argparse.Namespace) -> int:
             f"{PEOPLE_BASE}/people/me",
             params={"personFields": "names,emailAddresses"},
             headers={"Authorization": f"Bearer {creds.token}"},
-            timeout=15.0,
+            timeout=PROFILE_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
         me = resp.json()

@@ -21,6 +21,7 @@ DEFAULT_TOKEN_FILE = "~/.local/share/agora-gchat-bridge/token.json"
 DEFAULT_POLL_SECONDS = 5.0
 MIN_POLL_SECONDS = 2.0  # Chat's per-space read quota is generous, but not unlimited
 DEFAULT_RECONCILE_SECONDS = 60.0
+MIN_RECONCILE_SECONDS = 10.0
 SPACE_NAME = re.compile(r"spaces/[A-Za-z0-9_-]{1,64}")
 
 # Keys the config file may set, with their types; the space is per bridge and
@@ -153,6 +154,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         space=parse_space(args.space),
         token_file=expand(args.token),
         poll_seconds=max(MIN_POLL_SECONDS, float(args.poll)),
-        reconcile_seconds=max(10.0, float(args.reconcile)),
+        reconcile_seconds=max(MIN_RECONCILE_SECONDS, float(args.reconcile)),
         prefix=parse_prefix(args.prefix),
     )

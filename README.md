@@ -27,7 +27,7 @@ uv sync
 
 It opens Google's consent page and waits on a loopback port for the answer, then writes the token file `~/.local/share/agora-gchat-bridge/token.json` (mode 0600). On a machine without a browser, add `--manual`: it prints the URL; open it anywhere, and after the consent paste the address of the page your browser could not load (it starts with `http://127.0.0.1:8765/`) back into the terminal.
 
-The scopes asked for: reading messages, creating messages, reading spaces and their members (`chat.messages.readonly`, `chat.messages.create`, `chat.spaces.readonly`, `chat.memberships.readonly`), names and photos of your directory (`directory.readonly`), and your own identity (`openid`, `email`, `profile`). The bridge cannot edit or delete messages or change spaces.
+The scopes asked for: reading messages, creating messages, reading spaces (`chat.messages.readonly`, `chat.messages.create`, `chat.spaces.readonly`), names in your directory (`directory.readonly`), and your own identity (`openid`, `email`, `profile`). The bridge cannot edit or delete messages or change spaces.
 
 Find the space you want to bridge:
 
