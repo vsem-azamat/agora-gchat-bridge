@@ -52,3 +52,31 @@ def test_person_photo():
     default = person_from("users/1", {"photos": [{"url": "https://x/y=s100", "default": True}]})
     assert (default.name, default.rev) == ("user 1", "none")
     assert person_from("users/1", None).rev == ""
+
+
+def test_mentions_leave_urls_and_links_alone():
+    members = {"Ada": "users/1"}
+    assert mention_markup("https://medium.com/@Ada/post", members) == "https://medium.com/@Ada/post"
+    assert (
+        mention_markup("<https://x.org/a|@Ada> @Ada", members) == "<https://x.org/a|@Ada> <users/1>"
+    )
+    text = mention_markup(chat_markup("[@Ada](https://x.org/a)"), members)
+    assert text == "<https://x.org/a|@Ada>"
+
+
+def test_mention_with_unusual_case_folding_does_not_crash():
+    assert mention_markup("hi @İris", {"Iris": "users/1"}) in ("hi <users/1>", "hi @İris")
+
+
+def test_links_with_parentheses_and_unsafe_characters():
+    assert chat_markup("[Foo](https://en.wikipedia.org/wiki/Foo_(bar))") == (
+        "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>"
+    )
+    assert chat_markup("[a](https://x.org/a|b)") == "[a](https://x.org/a|b)"
+    assert chat_markup("[a > b](https://x.org/)") == "[a > b](https://x.org/)"
+
+
+def test_person_without_photos_is_unknown_not_none():
+    person = person_from("users/1", {"names": [{"displayName": "Ada"}]})
+    assert person.rev == "" and person.named
+    assert not person_from("users/1", None).named

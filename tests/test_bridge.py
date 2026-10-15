@@ -612,11 +612,10 @@ async def test_names_of_members_become_mentions(chat):
 async def test_members_are_read_again_after_a_while(chat, monkeypatch):
     h = await started(chat)
     h.out(21, "@Ada")
-    await h.until(lambda: h.of("sent"))
     h.out(22, "@Ada")
     await h.until(lambda: len(h.of("sent")) == 2)
     assert chat.member_reads == 1
-    monkeypatch.setattr("gchat_bridge.bridge.MEMBERS_TTL_SECONDS", 0.0)
+    h.bridge._members_due = 0.0  # the TTL ran out
     h.out(23, "@Ada")
     await h.until(lambda: len(h.of("sent")) == 3)
     assert chat.member_reads == 2
@@ -719,4 +718,123 @@ async def test_avatar_lines_keep_within_the_hubs_rate(chat, monkeypatch):
     await asyncio.sleep(0.1)
     assert len(h.of("avatar")) == 2
     await h.until(lambda: len(h.of("avatar")) == 3, timeout=2)
+    await h.stop()
+
+
+# --- review round 1 of mentions and avatars -----------------------------------
+
+
+async def test_members_without_an_answer_do_not_lose_the_message(chat):
+    async def no_answer(space):
+        raise TransportError("timeout")
+
+    chat.list_members = no_answer
+    h = await started(chat)
+    h.out(50, "@Ada hi")
+    await h.until(lambda: h.of("sent"))
+    assert chat.texts() == ["🤖 secretary: @Ada hi"]
+    await h.stop()
+
+
+async def test_members_are_not_read_on_every_send_after_a_failure(chat):
+    calls = []
+
+    async def refuse(space):
+        calls.append(space)
+        raise ApiError(403, "no scope")
+
+    chat.list_members = refuse
+    h = await started(chat)
+    h.out(51, "one")
+    h.out(52, "two")
+    await h.until(lambda: len(h.of("sent")) == 2)
+    assert len(calls) == 1
+    await h.stop()
+
+
+async def test_last_known_members_are_used_when_reading_them_again_fails(chat):
+    h = await started(chat)
+    h.out(53, "@Ada")
+    await h.until(lambda: h.of("sent"))
+
+    async def refuse(space):
+        raise ApiError(500, "boom")
+
+    chat.list_members = refuse
+    h.bridge._members_due = 0.0
+    h.out(54, "@Ada again")
+    await h.until(lambda: len(h.of("sent")) == 2)
+    assert chat.texts()[-1] == "🤖 secretary: <users/200> again"
+    await h.stop()
+
+
+async def test_only_human_members_with_a_directory_name_can_be_mentioned(chat):
+    chat.members = ["users/200", "users/777", "users/888"]
+    chat.people["users/777"] = "Robo"
+
+    async def members(space):
+        return [
+            {"member": {"name": "users/200", "type": "HUMAN"}},
+            {"member": {"name": "users/777", "type": "BOT"}},
+            {"member": {"name": "users/888", "type": "HUMAN"}},  # unknown to the directory
+        ]
+
+    chat.list_members = members
+    h = await started(chat)
+    h.out(55, "@Ada @Robo @user")
+    await h.until(lambda: h.of("sent"))
+    assert chat.texts() == ["🤖 secretary: <users/200> @Robo @user"]
+    await h.stop()
+
+
+async def test_person_without_any_photo_field_has_no_rev(chat):
+    async def no_photos(user):
+        return {"names": [{"displayName": "Ada"}]}
+
+    chat.get_person = no_photos
+    h = await started(chat)
+    chat.add("hi")
+    await h.until(lambda: h.ins())
+    assert "avatar_rev" not in h.ins()[0]["author"]
+    await asyncio.sleep(0.05)
+    assert h.of("avatar") == []
+    await h.stop()
+
+
+async def test_refused_photo_is_not_downloaded_again(chat):
+    chat.photos["users/200"] = "https://example.com/ada=s100"
+    chat.images["https://example.com/ada=s160"] = ApiError(403, "no")
+    h = await started(chat)
+    chat.add("hi")
+    await h.until(lambda: chat.downloads)
+    chat.add("again")
+    await h.until(lambda: len(h.ins()) == 2)
+    await asyncio.sleep(0.05)
+    assert len(chat.downloads) == 1
+    await h.stop()
+
+
+async def test_photo_without_an_answer_goes_to_the_back_of_the_queue(chat):
+    chat.photos["users/200"] = "https://example.com/ada=s100"
+    chat.photos["users/300"] = "https://example.com/grace=s100"
+    chat.images["https://example.com/ada=s160"] = [TransportError("timeout"), JPEG]
+    chat.images["https://example.com/grace=s160"] = PNG
+    h = await started(chat, avatar_retry=0.01)
+    chat.add("hi")
+    chat.add("hello", sender="users/300")
+    await h.until(lambda: len(h.of("avatar")) == 2)
+    assert [line["author"] for line in h.of("avatar")] == ["300", "200"]
+    await h.stop()
+
+
+async def test_photo_over_the_hubs_limit_is_skipped(chat):
+    from gchat_bridge.bridge import MAX_AVATAR_BYTES
+
+    chat.photos["users/200"] = "https://example.com/ada=s100"
+    chat.images["https://example.com/ada=s160"] = b"\xff\xd8\xff" + b"0" * MAX_AVATAR_BYTES
+    h = await started(chat)
+    chat.add("hi")
+    await h.until(lambda: chat.downloads)
+    await asyncio.sleep(0.05)
+    assert h.of("avatar") == []
     await h.stop()

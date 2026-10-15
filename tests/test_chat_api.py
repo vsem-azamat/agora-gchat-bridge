@@ -201,3 +201,17 @@ async def test_download(api, google):
     with pytest.raises(TransportError):
         await api.download("https://example.com/p=s160")
     assert "Authorization" not in google.chat_requests()[0].headers
+
+
+async def test_download_over_the_cap_is_refused(api, google):
+    from gchat_bridge.chat_api import MAX_DOWNLOAD_BYTES
+
+    google.chat.append(httpx.Response(200, content=b"0" * (MAX_DOWNLOAD_BYTES + 1)))
+    with pytest.raises(ApiError):
+        await api.download("https://example.com/p=s160")
+
+
+async def test_download_rate_limited_is_a_transport_error(api, google):
+    google.chat.append(error(429, "slow down"))
+    with pytest.raises(TransportError):
+        await api.download("https://example.com/p=s160")

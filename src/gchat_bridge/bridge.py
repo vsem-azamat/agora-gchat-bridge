@@ -74,6 +74,7 @@ SEEN_LIMIT = 5000  # message ids remembered as reported
 CACHE_LIMIT = 2000  # thread roots and names remembered
 NAME_TTL_SECONDS = 24 * 3600.0
 MEMBERS_TTL_SECONDS = 600.0  # members are read again this long after, for mentions
+MEMBERS_RETRY_SECONDS = 60.0  # after the members could not be read
 AVATAR_LINES = 30  # the hub takes at most 30 avatar lines a minute from a bridge
 AVATAR_WINDOW_SECONDS = 65.0  # a minute, with a margin for the hub's own timing
 AVATAR_RETRY_SECONDS = 30.0  # after a photo download got no answer
@@ -156,6 +157,7 @@ class Person:
     name: str
     photo_url: str = ""
     rev: str = ""
+    named: bool = False  # the name is the directory's, not a stand-in
 
 
 def person_from(user: str, data: dict[str, Any] | None) -> Person:
@@ -170,15 +172,20 @@ def person_from(user: str, data: dict[str, Any] | None) -> Person:
             name = entry["displayName"].strip()
             if name:
                 break
+    shown = name or fallback
     photos = [p for p in data.get("photos") or [] if isinstance(p, dict)]
     photo = next((p for p in photos if (p.get("metadata") or {}).get("primary")), None)
     photo = photo or (photos[0] if photos else None)
     url = photo.get("url") if photo else None
-    if photo is None or photo.get("default") or not isinstance(url, str) or not url:
-        return Person(name or fallback, rev=NO_AVATAR_REV)
+    if photo is not None and photo.get("default"):
+        return Person(shown, rev=NO_AVATAR_REV, named=bool(name))
+    if not isinstance(url, str) or not url:
+        # No photo named at all: unknown, not "none" (which drops an avatar
+        # the hub has).
+        return Person(shown, named=bool(name))
     base = _PHOTO_SIZE.sub("", url)
     rev = hashlib.sha256(base.encode()).hexdigest()[:16]
-    return Person(name or fallback, f"{base}=s{AVATAR_SIZE}", rev)
+    return Person(shown, f"{base}=s{AVATAR_SIZE}", rev, named=bool(name))
 
 
 def image_mime(data: bytes) -> str | None:
@@ -280,7 +287,7 @@ class Bridge:
         self._thread_roots: OrderedDict[str, str] = OrderedDict()  # thread name → root id
         self._people: dict[str, tuple[Person, float]] = {}
         self._members: dict[str, str] = {}  # name to mention by → users/ID
-        self._members_at: float | None = None
+        self._members_due: float | None = None  # when to read the members again
         # Avatars: the rev answered per author in this process, the ones still
         # to answer (oldest first) and when the recent avatar lines went out.
         self.avatar_window = avatar_window
@@ -382,23 +389,26 @@ class Bridge:
     async def _mention_names(self) -> dict[str, str]:
         """Names to mention the space's members by, read again every
         MEMBERS_TTL_SECONDS; the last known ones when reading fails."""
-        if self._members_at is not None and (
-            time.monotonic() - self._members_at < MEMBERS_TTL_SECONDS
-        ):
+        if self._members_due is not None and time.monotonic() < self._members_due:
             return self._members
         try:
             members = await self.api.list_members(self.space)
-        except ApiError as exc:
+            people = {}
+            for membership in members:
+                member = membership.get("member") or {}
+                user = member.get("name")
+                if member.get("type") == "HUMAN" and isinstance(user, str):
+                    person = await self._person(user)
+                    if person.named:  # a stand-in such as "user 123" names no one
+                        people[user] = person.name
+        except (ApiError, TransportError) as exc:
+            # A message must not wait for its mentions: go on with the last
+            # known members and try again a little later.
             log.warning("members not read: %s", short_reason(exc, 120))
+            self._members_due = time.monotonic() + MEMBERS_RETRY_SECONDS
             return self._members
-        people = {}
-        for membership in members:
-            member = membership.get("member") or {}
-            user = member.get("name")
-            if member.get("type") == "HUMAN" and isinstance(user, str):
-                people[user] = await self._name(user)
         self._members = member_names(people)
-        self._members_at = time.monotonic()
+        self._members_due = time.monotonic() + MEMBERS_TTL_SECONDS
         return self._members
 
     async def _names_for(self, msg: dict[str, Any]) -> dict[str, str]:

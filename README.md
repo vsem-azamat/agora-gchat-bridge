@@ -29,6 +29,8 @@ It opens Google's consent page and waits on a loopback port for the answer, then
 
 The scopes asked for: reading messages, creating messages, reading spaces and their members (`chat.messages.readonly`, `chat.messages.create`, `chat.spaces.readonly`, `chat.memberships.readonly`), names and photos in your directory (`directory.readonly`), and your own identity (`openid`, `email`, `profile`). The bridge cannot edit or delete messages or change spaces.
 
+Mentions need `chat.memberships.readonly`: with a token file granted without it, `@names` stay text until you run `gchat-bridge login` again.
+
 Find the space you want to bridge:
 
 ```sh
