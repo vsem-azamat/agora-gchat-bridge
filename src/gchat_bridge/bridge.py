@@ -18,12 +18,13 @@ hold the same lock.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
 import re
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -31,6 +32,7 @@ from typing import Any, Protocol
 
 from gchat_bridge.config import DEFAULT_PREFIX, MAX_PREFIX_UTF16
 from gchat_bridge.errors import ApiError, ConfigError, TransportError
+from gchat_bridge.outgoing import chat_markup, member_names, mention_markup
 from gchat_bridge.render import (
     format_time,
     mentions,
@@ -71,6 +73,16 @@ RECONCILE_LOOKBACK = timedelta(minutes=2)
 SEEN_LIMIT = 5000  # message ids remembered as reported
 CACHE_LIMIT = 2000  # thread roots and names remembered
 NAME_TTL_SECONDS = 24 * 3600.0
+MEMBERS_TTL_SECONDS = 600.0  # members are read again this long after, for mentions
+MEMBERS_RETRY_SECONDS = 60.0  # after the members could not be read
+AVATAR_LINES = 30  # the hub takes at most 30 avatar lines a minute from a bridge
+AVATAR_WINDOW_SECONDS = 65.0  # a minute, with a margin for the hub's own timing
+AVATAR_RETRY_SECONDS = 30.0  # after a photo download got no answer
+AVATAR_SIZE = 160  # pixels; Google serves profile photos at the size asked for
+MAX_AVATAR_BYTES = 256 * 1024  # the hub refuses larger PNG and JPEG images
+NO_AVATAR_REV = "none"  # the rev of "this person has no avatar"
+IMAGE_SIGNATURES = ((b"\xff\xd8\xff", "image/jpeg"), (b"\x89PNG\r\n\x1a\n", "image/png"))
+_PHOTO_SIZE = re.compile(r"=[a-z][0-9a-z-]*$")
 STARTUP_ATTEMPTS = 6
 READ_ERROR_PAUSE_SECONDS = 5.0
 
@@ -102,6 +114,10 @@ class Api(Protocol):
 
     async def get_person(self, user: str) -> dict[str, Any] | None: ...
 
+    async def list_members(self, space: str) -> list[dict[str, Any]]: ...
+
+    async def download(self, url: str) -> bytes: ...
+
 
 @dataclass(frozen=True, order=True)
 class Cursor:
@@ -131,6 +147,50 @@ class Root:
     sender: str
     marked: bool  # the bridge's or an assistant's message
     title: str
+
+
+@dataclass(frozen=True)
+class Person:
+    """What the directory says of a user: their name and, when known, their
+    profile photo (`rev` `none` for a person without one, "" when unknown)."""
+
+    name: str
+    photo_url: str = ""
+    rev: str = ""
+    named: bool = False  # the name is the directory's, not a stand-in
+
+
+def person_from(user: str, data: dict[str, Any] | None) -> Person:
+    """A Person from the People API's answer (None: the directory does not
+    know them, so neither the name nor the photo is known)."""
+    fallback = f"user {user_id(user)}"
+    if data is None:
+        return Person(fallback)
+    name = ""
+    for entry in data.get("names") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("displayName"), str):
+            name = entry["displayName"].strip()
+            if name:
+                break
+    shown = name or fallback
+    photos = [p for p in data.get("photos") or [] if isinstance(p, dict)]
+    photo = next((p for p in photos if (p.get("metadata") or {}).get("primary")), None)
+    photo = photo or (photos[0] if photos else None)
+    url = photo.get("url") if photo else None
+    if photo is not None and photo.get("default"):
+        return Person(shown, rev=NO_AVATAR_REV, named=bool(name))
+    if not isinstance(url, str) or not url:
+        # No photo named at all: unknown, not "none" (which drops an avatar
+        # the hub has).
+        return Person(shown, named=bool(name))
+    base = _PHOTO_SIZE.sub("", url)
+    rev = hashlib.sha256(base.encode()).hexdigest()[:16]
+    return Person(shown, f"{base}=s{AVATAR_SIZE}", rev, named=bool(name))
+
+
+def image_mime(data: bytes) -> str | None:
+    """The media type of a JPEG or PNG image, None for anything else."""
+    return next((mime for sig, mime in IMAGE_SIGNATURES if data.startswith(sig)), None)
 
 
 @dataclass
@@ -197,6 +257,8 @@ class Bridge:
         poll_seconds: float = 5.0,
         reconcile_seconds: float = 60.0,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        avatar_window: float = AVATAR_WINDOW_SECONDS,
+        avatar_retry: float = AVATAR_RETRY_SECONDS,
     ) -> None:
         self.api = api
         self.space = space
@@ -223,7 +285,17 @@ class Bridge:
         self._history_known = False
         self._roots: OrderedDict[str, Root] = OrderedDict()  # by root message id
         self._thread_roots: OrderedDict[str, str] = OrderedDict()  # thread name → root id
-        self._names: dict[str, tuple[str, float]] = {}
+        self._people: dict[str, tuple[Person, float]] = {}
+        self._members: dict[str, str] = {}  # name to mention by → users/ID
+        self._members_due: float | None = None  # when to read the members again
+        # Avatars: the rev answered per author in this process, the ones still
+        # to answer (oldest first) and when the recent avatar lines went out.
+        self.avatar_window = avatar_window
+        self.avatar_retry = avatar_retry
+        self._avatar_revs: dict[str, str] = {}
+        self._avatar_wanted: dict[str, tuple[str, str]] = {}  # author → (rev, url)
+        self._avatar_wake = asyncio.Event()
+        self._avatar_times: deque[float] = deque()
         self._accepted: set[int] = set()  # out ids taken in this process
         self._job: SendJob | None = None
         self._lock = asyncio.Lock()
@@ -299,28 +371,118 @@ class Bridge:
         while len(self._thread_roots) > CACHE_LIMIT:
             self._thread_roots.popitem(last=False)
 
-    async def _name(self, user: str) -> str:
-        cached = self._names.get(user)
+    async def _person(self, user: str) -> Person:
+        cached = self._people.get(user)
         if cached and time.monotonic() - cached[1] < NAME_TTL_SECONDS:
             return cached[0]
-        name = ""
         try:
-            person = await self.api.get_person(user)
+            person = person_from(user, await self.api.get_person(user))
         except ApiError as exc:
             log.warning("name of %s not read: %s", user_id(user), short_reason(exc, 120))
-            person = None
-        for entry in (person or {}).get("names") or []:
-            if isinstance(entry, dict) and isinstance(entry.get("displayName"), str):
-                name = entry["displayName"].strip()
-                if name:
-                    break
-        name = name or f"user {user_id(user)}"
-        self._names[user] = (name, time.monotonic())
-        return name
+            person = Person(f"user {user_id(user)}")
+        self._people[user] = (person, time.monotonic())
+        return person
+
+    async def _name(self, user: str) -> str:
+        return (await self._person(user)).name
+
+    async def _mention_names(self) -> dict[str, str]:
+        """Names to mention the space's members by, read again every
+        MEMBERS_TTL_SECONDS; the last known ones when reading fails."""
+        if self._members_due is not None and time.monotonic() < self._members_due:
+            return self._members
+        try:
+            members = await self.api.list_members(self.space)
+            people = {}
+            for membership in members:
+                member = membership.get("member") or {}
+                user = member.get("name")
+                if member.get("type") == "HUMAN" and isinstance(user, str):
+                    person = await self._person(user)
+                    if person.named:  # a stand-in such as "user 123" names no one
+                        people[user] = person.name
+        except (ApiError, TransportError) as exc:
+            # A message must not wait for its mentions: go on with the last
+            # known members and try again a little later.
+            log.warning("members not read: %s", short_reason(exc, 120))
+            self._members_due = time.monotonic() + MEMBERS_RETRY_SECONDS
+            return self._members
+        self._members = member_names(people)
+        self._members_due = time.monotonic() + MEMBERS_TTL_SECONDS
+        return self._members
 
     async def _names_for(self, msg: dict[str, Any]) -> dict[str, str]:
         """Display names of the users a message's text mentions."""
         return {user: await self._name(user) for user in mentions(msg) if user != "users/all"}
+
+    # --- avatars ----------------------------------------------------------
+
+    def _want_avatar(self, author: dict[str, Any], person: Person) -> None:
+        author["avatar_rev"] = person.rev
+        if self._avatar_revs.get(author["id"]) != person.rev:
+            self._avatar_wanted[author["id"]] = (person.rev, person.photo_url)
+            self._avatar_wake.set()
+
+    async def _avatar_turn(self) -> None:
+        """Wait until another avatar line keeps within the hub's rate."""
+        while len(self._avatar_times) >= AVATAR_LINES:
+            wait = self._avatar_times[0] + self.avatar_window - time.monotonic()
+            if wait <= 0:
+                self._avatar_times.popleft()
+            else:
+                await asyncio.sleep(wait)
+
+    async def _avatar_line(self, author: str, rev: str, url: str) -> dict[str, Any] | None:
+        line: dict[str, Any] = {"type": "avatar", "author": author, "data": "", "rev": rev}
+        if rev == NO_AVATAR_REV:
+            return line
+        try:
+            data = await self.api.download(url)
+        except ApiError as exc:
+            log.warning("avatar of %s not read: %s", author, short_reason(exc, 120))
+            return None
+        mime = image_mime(data)
+        if mime is None or len(data) > MAX_AVATAR_BYTES:
+            log.warning(
+                "avatar of %s skipped: %s, %d bytes", author, mime or "not JPEG or PNG", len(data)
+            )
+            return None
+        line["mime"] = mime
+        line["data"] = base64.b64encode(data).decode("ascii")
+        return line
+
+    async def _avatars_loop(self) -> None:
+        """Answer the wanted avatars, oldest first. A download without an answer
+        is tried again later, at the back of the queue: it does not end the
+        connection, which the other loops judge."""
+        while True:
+            if not self._avatar_wanted:
+                self._avatar_wake.clear()
+                await self._avatar_wake.wait()
+                continue
+            await self._avatar_turn()
+            author, (rev, url) = next(iter(self._avatar_wanted.items()))
+            try:
+                line = await self._avatar_line(author, rev, url)
+            except TransportError as exc:
+                log.warning(
+                    "avatar of %s: no answer (%s); trying again in %.0f s",
+                    author,
+                    short_reason(exc, 120),
+                    self.avatar_retry,
+                )
+                if self._avatar_wanted.get(author, ("",))[0] == rev:
+                    del self._avatar_wanted[author]
+                    self._avatar_wanted[author] = (rev, url)
+                await asyncio.sleep(self.avatar_retry)
+                continue
+            if self._avatar_wanted.get(author, ("",))[0] == rev:
+                del self._avatar_wanted[author]
+            # A photo that could not be read is not asked for again until it changes.
+            self._avatar_revs[author] = rev
+            if line is not None:
+                self.emit(line)
+                self._avatar_times.append(time.monotonic())
 
     # --- reading ------------------------------------------------------------
 
@@ -391,12 +553,14 @@ class Bridge:
                 "name": display if isinstance(display, str) and display else "app",
                 "self": False,
             }
+        elif sender_name:
+            person = await self._person(sender_name)
+            author = {"id": user_id(sender_name), "name": person.name, "self": own_account}
+            # The operator's messages show the operator's avatar.
+            if person.rev and not own_account:
+                self._want_avatar(author, person)
         else:
-            author = {
-                "id": user_id(sender_name),
-                "name": await self._name(sender_name) if sender_name else "Unknown",
-                "self": own_account,
-            }
+            author = {"id": "", "name": "Unknown", "self": False}
         line: dict[str, Any] = {
             "type": "in",
             "id": msg_id,
@@ -527,6 +691,7 @@ class Bridge:
             self.emit({"type": "failed", "id": out_id, "error": "empty message"})
             return
         root = _ext(line.get("thread")) or _ext(line.get("reply_to"))
+        text = mention_markup(chat_markup(text), await self._mention_names())
         self._job = SendJob(
             out_id=out_id,
             chunks=split_message(text, MAX_MESSAGE_UTF16),
@@ -719,6 +884,7 @@ class Bridge:
         tasks = {
             asyncio.ensure_future(self._poll_loop()),
             asyncio.ensure_future(self._outbound_loop()),
+            asyncio.ensure_future(self._avatars_loop()),
         }
         try:
             done, _ = await asyncio.wait(tasks | {closed}, return_when=asyncio.FIRST_COMPLETED)
