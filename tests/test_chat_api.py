@@ -263,6 +263,7 @@ async def test_download_larger_than_announced_cap_is_refused_unread(api, google)
         "http://lh3.googleusercontent.com/a/example=s160",
         "https://googleusercontent.com.example.com/a=s160",
         "https://evilgoogleusercontent.com/a=s160",
+        "https://xn--a.googleusercontent.com/a=s160",
         "not a url",
     ],
 )

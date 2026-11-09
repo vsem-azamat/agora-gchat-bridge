@@ -167,10 +167,22 @@ class ChatApi:
             parsed = httpx.URL(url)
         except httpx.InvalidURL:
             raise ApiError(400, "download: not a URL") from None
-        if parsed.scheme != "https" or not parsed.host.endswith(PHOTO_HOST_SUFFIX):
-            raise ApiError(400, f"download: host {parsed.host or '(none)'} is not a photo host")
+        # raw_host is the ASCII form as sent; .host decodes IDNA and can raise.
+        host = parsed.raw_host.decode("ascii", "replace")
+        if parsed.scheme != "https" or not host.endswith(PHOTO_HOST_SUFFIX):
+            raise ApiError(400, f"download: host {host or '(none)'} is not a photo host")
         try:
-            async with self._http.stream("GET", parsed, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+            parsed.host  # noqa: B018 - httpx decodes it to send; bad IDNA raises
+        except ValueError:
+            raise ApiError(400, f"download: host {host} is not a valid name") from None
+        try:
+            async with self._http.stream(
+                "GET",
+                parsed,
+                # Uncompressed, so the cap bounds memory, not just bytes received.
+                headers={"Accept-Encoding": "identity"},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            ) as resp:
                 if resp.status_code >= 500 or resp.status_code == 429:
                     raise TransportError(f"download: HTTP {resp.status_code}")
                 if resp.status_code != 200:

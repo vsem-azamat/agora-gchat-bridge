@@ -28,7 +28,7 @@ _AUTH = "https://www.googleapis.com/auth/"
 SCOPE_FEATURES: dict[str, tuple[bool, str]] = {
     "openid": (False, "nothing the bridge uses"),
     _AUTH + "userinfo.email": (False, "the login cannot show which account it is"),
-    _AUTH + "userinfo.profile": (False, "the login cannot show which account it is"),
+    _AUTH + "userinfo.profile": (False, "nothing the bridge uses"),
     _AUTH + "chat.messages.readonly": (True, "the bridge cannot read the space"),
     _AUTH + "chat.messages.create": (True, "the bridge cannot send to the space"),
     _AUTH + "chat.spaces.readonly": (True, "the bridge cannot read what kind of space it is"),

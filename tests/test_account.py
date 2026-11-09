@@ -101,6 +101,13 @@ def test_login_without_send_fails_and_keeps_no_token(login, capsys):
     assert "chat.messages.create" in capsys.readouterr().err
 
 
+def test_failed_login_leaves_an_older_token_as_it_was(login):
+    run, token = login
+    token.write_text("older token")
+    assert run([s for s in SCOPES if s != CHAT + "messages.readonly"]) == 1
+    assert token.read_text() == "older token"
+
+
 def test_login_with_every_scope_is_quiet(login, capsys):
     run, _ = login
     assert run(list(SCOPES)) == 0
