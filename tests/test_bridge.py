@@ -838,3 +838,97 @@ async def test_photo_over_the_hubs_limit_is_skipped(chat):
     await asyncio.sleep(0.05)
     assert h.of("avatar") == []
     await h.stop()
+
+
+# --- reliability -----------------------------------------------------------------
+
+
+async def test_sender_whose_name_keeps_failing_comes_in_as_a_stand_in(chat):
+    from gchat_bridge.bridge import PERSON_ATTEMPTS
+
+    h = await started(chat)
+    chat.person_errors.extend([TransportError("People API 503")] * PERSON_ATTEMPTS)
+    chat.add("first")
+    chat.add("second", sender="users/300")
+    for _ in range(PERSON_ATTEMPTS - 1):
+        with pytest.raises(TransportError):
+            await asyncio.wait_for(h.task, 2)
+        h.start()  # the reconnect
+    await h.until(lambda: len(h.ins()) == 2)
+    assert [line["author"]["name"] for line in h.ins()] == ["user 200", "Grace"]
+    await h.stop()
+
+
+async def test_a_stand_in_name_is_looked_up_again_later(chat):
+    from gchat_bridge.bridge import PERSON_ATTEMPTS
+
+    def expire(user: str) -> None:
+        person, _ = h.bridge._people[user]
+        h.bridge._people[user] = (person, 0.0)
+
+    h = await started(chat)
+    chat.person_errors.extend([TransportError("People API 503")] * PERSON_ATTEMPTS)
+    chat.add("first")
+    for _ in range(PERSON_ATTEMPTS - 1):
+        with pytest.raises(TransportError):
+            await asyncio.wait_for(h.task, 2)
+        h.start()
+    await h.until(lambda: h.ins())
+    expire("users/200")
+    chat.person_errors.append(TransportError("still 503"))
+    chat.add("second")  # no answer again: the stand-in stays, without a reconnect
+    await h.until(lambda: len(h.ins()) == 2)
+    expire("users/200")
+    chat.add("third")  # an answer gives the name
+    await h.until(lambda: len(h.ins()) == 3)
+    assert [line["author"]["name"] for line in h.ins()] == ["user 200"] * 2 + ["Ada"]
+    assert not h.task.done()
+    await h.stop()
+
+
+async def test_reading_members_does_not_hold_up_reads(chat):
+    h = await started(chat)
+    release = asyncio.Event()
+    original = chat.list_members
+
+    async def slow(space):
+        await release.wait()
+        return await original(space)
+
+    chat.list_members = slow
+    h.out(60, "@Ada hi")
+    await asyncio.sleep(0.05)
+    chat.add("meanwhile")
+    await h.until(lambda: h.ins())  # read while the members are still being read
+    assert h.of("sent") == []
+    release.set()
+    await h.until(lambda: h.of("sent"))
+    assert chat.texts()[-1] == "🤖 secretary: <users/200> hi"
+    await h.stop()
+
+
+async def test_stopping_during_startup_sends_no_further_queued_messages(chat):
+    chat.create_delay = 0.1
+    h = Harness(chat)
+    h.hello()
+    for n in range(5):
+        h.out(70 + n, f"queued {n}")
+    h.start()
+    await h.until(lambda: chat.creates)
+    await h.stop()
+    assert len(chat.creates) == 1
+    assert h.of("sent") == [{"type": "sent", "id": 70, "ext_id": "m1"}]
+
+
+async def test_stopping_during_startup_bounds_the_send_in_flight(chat, monkeypatch):
+    monkeypatch.setattr("gchat_bridge.bridge.STOP_GRACE_SECONDS", 0.1)
+    chat.create_delay = 3.0
+    h = Harness(chat)
+    h.hello()
+    h.out(80, "slow")
+    h.start()
+    await h.until(lambda: chat.creates)
+    started_at = asyncio.get_running_loop().time()
+    h.bridge.closed.set()
+    await asyncio.wait_for(h.task, 1)
+    assert asyncio.get_running_loop().time() - started_at < 0.5
