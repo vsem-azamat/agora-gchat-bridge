@@ -292,6 +292,7 @@ class Bridge:
         self._people: dict[str, tuple[Person, float]] = {}  # user → (person, good until)
         self._person_failures: dict[str, int] = {}  # lookups without an answer in a row
         self._members: dict[str, str] = {}  # name to mention by → users/ID
+        self._member_people: dict[str, str] = {}  # users/ID → name, as last read
         self._members_due: float | None = None  # when to read the members again
         # Avatars: the rev answered per author in this process, the ones still
         # to answer (oldest first) and when the recent avatar lines went out.
@@ -425,35 +426,45 @@ class Bridge:
         if self._members_due is not None and time.monotonic() < self._members_due:
             return
         try:
-            people = await self._read_members()
+            people, read_all = await self._read_members()
         except (ApiError, TransportError) as exc:
             # A message must not wait for its mentions: go on with the last
             # known members and try again a little later.
             log.warning("members not read: %s", short_reason(exc, 120))
-            people = None
-        if people is None:
             self._members_due = time.monotonic() + MEMBERS_RETRY_SECONDS
             return
+        self._member_people = people
         self._members = member_names(people)
-        self._members_due = time.monotonic() + MEMBERS_TTL_SECONDS
+        ttl = MEMBERS_TTL_SECONDS if read_all else MEMBERS_RETRY_SECONDS
+        self._members_due = time.monotonic() + ttl
 
-    async def _read_members(self) -> dict[str, str] | None:
-        """The space's human members the directory names, as users/ID → name;
-        None when a member's name could not be read. These lookups do not
-        count towards PERSON_ATTEMPTS: a reader gives up on a sender, the
-        members are kept as they were."""
-        people = {}
+    async def _read_members(self) -> tuple[dict[str, str], bool]:
+        """The space's human members the directory names, as users/ID → name,
+        and whether any member's name was read. A member whose name cannot
+        be read keeps the name last read for them, or is left out. These
+        lookups do not count towards PERSON_ATTEMPTS: a reader gives up on a
+        sender, a member keeps their last known name."""
+        people: dict[str, str] = {}
+        humans = failed = 0
         for membership in await self.api.list_members(self.space):
             member = membership.get("member") or {}
             user = member.get("name")
-            if member.get("type") == "HUMAN" and isinstance(user, str):
-                person = await self._person(user, give_up=False)
-                if person.failed:
-                    log.warning("members not read: name of %s not read", user_id(user))
-                    return None
-                if person.named:  # a stand-in such as "user 123" names no one
-                    people[user] = person.name
-        return people
+            if member.get("type") != "HUMAN" or not isinstance(user, str):
+                continue
+            humans += 1
+            try:
+                person: Person | None = await self._person(user, give_up=False)
+            except TransportError:
+                person = None
+            if person is None or person.failed:
+                failed += 1
+                if user in self._member_people:
+                    people[user] = self._member_people[user]
+            elif person.named:  # a stand-in such as "user 123" names no one
+                people[user] = person.name
+        if failed:
+            log.warning("members: %d of %d names not read; last known ones kept", failed, humans)
+        return people, failed < humans or not humans
 
     async def _names_for(self, msg: dict[str, Any]) -> dict[str, str]:
         """Display names of the users a message's text mentions."""
@@ -893,6 +904,8 @@ class Bridge:
             while not self.outbox.empty() and not self.closed.is_set():
                 # Under the lock: the loops that read have not started yet.
                 await self._refresh_members()
+                if self.closed.is_set():
+                    break
                 await self._process(self.outbox.get_nowait())
             if self.closed.is_set():
                 return

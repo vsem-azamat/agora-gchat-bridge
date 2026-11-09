@@ -1050,3 +1050,82 @@ async def test_member_refreshes_do_not_count_towards_giving_up_on_a_sender(chat)
     await h.until(lambda: h.ins())
     assert h.ins()[0]["author"]["name"] == "Ada"
     await h.stop()
+
+
+async def test_stopping_while_startup_reads_the_members_sends_nothing(chat):
+    gate = asyncio.Event()
+    original = chat.list_members
+
+    async def slow(space):
+        await gate.wait()
+        return await original(space)
+
+    chat.list_members = slow
+    h = Harness(chat)
+    h.hello()
+    h.out(110, "queued")
+    h.start()
+    await asyncio.sleep(0.05)  # startup reads the members for the queued line
+    h.bridge.closed.set()
+    gate.set()
+    await asyncio.wait_for(h.task, 2)
+    assert chat.creates == []
+
+
+async def test_a_member_google_refuses_does_not_stop_the_others_being_mentioned(chat):
+    original = chat.get_person
+
+    async def refuse_grace(user):
+        if user == "users/300":
+            raise ApiError(400, "bad")
+        return await original(user)
+
+    chat.get_person = refuse_grace
+    h = await started(chat)
+    h.out(111, "@Ada hi @Grace")
+    await h.until(lambda: h.of("sent"))
+    assert chat.texts() == ["🤖 secretary: <users/200> hi @Grace"]
+    await h.stop()
+
+
+async def test_a_known_member_whose_lookup_fails_stays_mentionable(chat, monkeypatch):
+    monkeypatch.setattr("gchat_bridge.bridge.MEMBERS_TTL_SECONDS", 0.05)
+    monkeypatch.setattr("gchat_bridge.bridge.NAME_TTL_SECONDS", 0.05)
+    h = await started(chat)
+    h.out(112, "@Ada hi")
+    await h.until(lambda: h.of("sent"))
+    original = chat.get_person
+
+    async def refuse_ada(user):
+        if user == "users/200":
+            raise ApiError(400, "bad")
+        return await original(user)
+
+    chat.get_person = refuse_ada
+    await asyncio.sleep(0.1)  # the members and Ada's name ran out
+    chat.people["users/300"] = "Grace Hopper"
+    h.out(113, "@Ada and @Grace Hopper")
+    await h.until(lambda: len(h.of("sent")) == 2)
+    assert chat.texts()[-1] == "🤖 secretary: <users/200> and <users/300>"
+    await h.stop()
+
+
+async def test_members_that_could_not_be_listed_are_read_again_sooner(chat, monkeypatch):
+    monkeypatch.setattr("gchat_bridge.bridge.MEMBERS_RETRY_SECONDS", 0.05)
+    original = chat.list_members
+    answers = [TransportError("timeout")]
+
+    async def first_fails(space):
+        if answers:
+            raise answers.pop()
+        return await original(space)
+
+    chat.list_members = first_fails
+    h = await started(chat)
+    h.out(114, "@Ada one")
+    await h.until(lambda: h.of("sent"))
+    await asyncio.sleep(0.1)  # MEMBERS_RETRY_SECONDS, well before MEMBERS_TTL_SECONDS
+    h.out(115, "@Ada two")
+    await h.until(lambda: len(h.of("sent")) == 2)
+    assert chat.texts() == ["🤖 secretary: @Ada one", "🤖 secretary: <users/200> two"]
+    await h.stop()
