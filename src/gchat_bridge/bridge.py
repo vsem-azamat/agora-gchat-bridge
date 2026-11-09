@@ -73,6 +73,8 @@ RECONCILE_LOOKBACK = timedelta(minutes=2)
 SEEN_LIMIT = 5000  # message ids remembered as reported
 CACHE_LIMIT = 2000  # thread roots and names remembered
 NAME_TTL_SECONDS = 24 * 3600.0
+NAME_RETRY_SECONDS = 300.0  # a stand-in name from a failed lookup is looked up again after this
+PERSON_ATTEMPTS = 3  # lookups without an answer in a row before a sender comes in as a stand-in
 MEMBERS_TTL_SECONDS = 600.0  # members are read again this long after, for mentions
 MEMBERS_RETRY_SECONDS = 60.0  # after the members could not be read
 AVATAR_LINES = 30  # the hub takes at most 30 avatar lines a minute from a bridge
@@ -84,6 +86,7 @@ NO_AVATAR_REV = "none"  # the rev of "this person has no avatar"
 IMAGE_SIGNATURES = ((b"\xff\xd8\xff", "image/jpeg"), (b"\x89PNG\r\n\x1a\n", "image/png"))
 _PHOTO_SIZE = re.compile(r"=[a-z][0-9a-z-]*$")
 STARTUP_ATTEMPTS = 6
+STOP_GRACE_SECONDS = 4.0  # a send in flight is finished this long; the hub kills 5 s after SIGTERM
 READ_ERROR_PAUSE_SECONDS = 5.0
 
 
@@ -158,6 +161,7 @@ class Person:
     photo_url: str = ""
     rev: str = ""
     named: bool = False  # the name is the directory's, not a stand-in
+    failed: bool = False  # a stand-in because the lookup failed, not the directory's answer
 
 
 def person_from(user: str, data: dict[str, Any] | None) -> Person:
@@ -285,8 +289,10 @@ class Bridge:
         self._history_known = False
         self._roots: OrderedDict[str, Root] = OrderedDict()  # by root message id
         self._thread_roots: OrderedDict[str, str] = OrderedDict()  # thread name → root id
-        self._people: dict[str, tuple[Person, float]] = {}
+        self._people: dict[str, tuple[Person, float]] = {}  # user → (person, good until)
+        self._person_failures: dict[str, int] = {}  # lookups without an answer in a row
         self._members: dict[str, str] = {}  # name to mention by → users/ID
+        self._member_people: dict[str, str] = {}  # users/ID → name, as last read
         self._members_due: float | None = None  # when to read the members again
         # Avatars: the rev answered per author in this process, the ones still
         # to answer (oldest first) and when the recent avatar lines went out.
@@ -371,45 +377,100 @@ class Bridge:
         while len(self._thread_roots) > CACHE_LIMIT:
             self._thread_roots.popitem(last=False)
 
-    async def _person(self, user: str) -> Person:
+    async def _person(self, user: str, *, give_up: bool = True) -> Person:
+        """A user's directory record, cached. A lookup Google refuses, or the
+        PERSON_ATTEMPTS-th in a row without an answer, gives the stand-in
+        `user <id>` for NAME_RETRY_SECONDS; before that, no answer raises, so
+        the message is read again after the reconnect. Without `give_up`, no
+        answer always raises and is not counted."""
         cached = self._people.get(user)
-        if cached and time.monotonic() - cached[1] < NAME_TTL_SECONDS:
+        if cached and time.monotonic() < cached[1]:
             return cached[0]
         try:
             person = person_from(user, await self.api.get_person(user))
+        except TransportError as exc:
+            if not give_up:
+                raise
+            failures = self._person_failures.get(user, 0) + 1
+            self._person_failures[user] = failures
+            if failures < PERSON_ATTEMPTS:
+                raise
+            log.warning(
+                "name of %s: no answer %d times (%s); a stand-in for now",
+                user_id(user),
+                failures,
+                short_reason(exc, 120),
+            )
+            return self._stand_in(user)
         except ApiError as exc:
             log.warning("name of %s not read: %s", user_id(user), short_reason(exc, 120))
-            person = Person(f"user {user_id(user)}")
-        self._people[user] = (person, time.monotonic())
+            return self._stand_in(user)
+        self._person_failures.pop(user, None)
+        self._people[user] = (person, time.monotonic() + NAME_TTL_SECONDS)
+        return person
+
+    def _stand_in(self, user: str) -> Person:
+        person = Person(f"user {user_id(user)}", failed=True)
+        self._people[user] = (person, time.monotonic() + NAME_RETRY_SECONDS)
         return person
 
     async def _name(self, user: str) -> str:
         return (await self._person(user)).name
 
-    async def _mention_names(self) -> dict[str, str]:
-        """Names to mention the space's members by, read again every
-        MEMBERS_TTL_SECONDS; the last known ones when reading fails."""
+    async def _refresh_members(self) -> None:
+        """Read the names to mention the space's members by, when
+        MEMBERS_TTL_SECONDS have passed; the last known ones stay when reading
+        fails, a member's name among them. Called outside the lock where it
+        can be: reading every member's People record can take seconds in a
+        large space, and reads must not wait for it."""
         if self._members_due is not None and time.monotonic() < self._members_due:
-            return self._members
+            return
         try:
-            members = await self.api.list_members(self.space)
-            people = {}
-            for membership in members:
-                member = membership.get("member") or {}
-                user = member.get("name")
-                if member.get("type") == "HUMAN" and isinstance(user, str):
-                    person = await self._person(user)
-                    if person.named:  # a stand-in such as "user 123" names no one
-                        people[user] = person.name
+            people, read_all = await self._read_members()
         except (ApiError, TransportError) as exc:
             # A message must not wait for its mentions: go on with the last
             # known members and try again a little later.
             log.warning("members not read: %s", short_reason(exc, 120))
             self._members_due = time.monotonic() + MEMBERS_RETRY_SECONDS
-            return self._members
+            return
+        self._member_people = people
         self._members = member_names(people)
-        self._members_due = time.monotonic() + MEMBERS_TTL_SECONDS
-        return self._members
+        ttl = MEMBERS_TTL_SECONDS if read_all else MEMBERS_RETRY_SECONDS
+        self._members_due = time.monotonic() + ttl
+
+    async def _read_members(self) -> tuple[dict[str, str], bool]:
+        """The space's human members the directory names, as users/ID → name,
+        and whether the names were read: False when no member's name was, or
+        when a lookup got no answer. A member whose name cannot be read keeps
+        the name last read for them, or is left out. After a lookup without
+        an answer no further name is looked up: each one would wait through
+        the client's retries, and the send waits for the refresh. These
+        lookups do not count towards PERSON_ATTEMPTS: a reader gives up on a
+        sender, a member keeps their last known name."""
+        people: dict[str, str] = {}
+        humans = failed = 0
+        unanswered = False
+        for membership in await self.api.list_members(self.space):
+            member = membership.get("member") or {}
+            user = member.get("name")
+            if member.get("type") != "HUMAN" or not isinstance(user, str):
+                continue
+            humans += 1
+            person: Person | None = None
+            if not unanswered:
+                try:
+                    person = await self._person(user, give_up=False)
+                except TransportError:
+                    unanswered = True
+            if person is None or person.failed:
+                failed += 1
+                if user in self._member_people:
+                    people[user] = self._member_people[user]
+            elif person.named:  # a stand-in such as "user 123" names no one
+                people[user] = person.name
+        if failed:
+            log.warning("members: %d of %d names not read; last known ones kept", failed, humans)
+        return people, not unanswered and (failed < humans or not humans)
 
     async def _names_for(self, msg: dict[str, Any]) -> dict[str, str]:
         """Display names of the users a message's text mentions."""
@@ -691,7 +752,7 @@ class Bridge:
             self.emit({"type": "failed", "id": out_id, "error": "empty message"})
             return
         root = _ext(line.get("thread")) or _ext(line.get("reply_to"))
-        text = mention_markup(chat_markup(text), await self._mention_names())
+        text = mention_markup(chat_markup(text), self._members)
         self._job = SendJob(
             out_id=out_id,
             chunks=split_message(text, MAX_MESSAGE_UTF16),
@@ -764,6 +825,7 @@ class Bridge:
         log.warning("message %s not sent (%d of %d parts)", job.out_id, job.done, len(job.chunks))
 
     async def _process_locked(self, line: dict[str, Any]) -> None:
+        await self._refresh_members()
         async with self._lock:
             await self._process(line)
             # Report own messages and anything that came in meanwhile now,
@@ -835,6 +897,9 @@ class Bridge:
         log.info("no cursor: starting at %s", self.cursor)
 
     async def _startup(self) -> None:
+        """Resolve the space, finish the job left from before a reconnect, send
+        what queued meanwhile and read. Once the bridge is stopping, it starts
+        no further send."""
         if not self._resolved:
             await self._resolve_space()
         async with self._lock:
@@ -842,8 +907,14 @@ class Bridge:
                 await self._start_cursor()
             if self._job is not None:
                 await self._run_job(self._job)
-            while not self.outbox.empty():
+            while not self.outbox.empty() and not self.closed.is_set():
+                # Under the lock: the loops that read have not started yet.
+                await self._refresh_members()
+                if self.closed.is_set():
+                    break
                 await self._process(self.outbox.get_nowait())
+            if self.closed.is_set():
+                return
             await self._read_locked(RECONCILE_LOOKBACK)
         self._last_reconcile = time.monotonic()
 
@@ -872,13 +943,23 @@ class Bridge:
         if self.closed.is_set():
             closed.cancel()
             return
+        # Startup sends too, so stopping bounds it as it bounds a send in flight.
+        startup = asyncio.ensure_future(self._startup())
         try:
-            await self._startup()
+            await asyncio.wait({startup, closed}, return_when=asyncio.FIRST_COMPLETED)
+            if not startup.done():
+                self._in_flight = startup
+                await self._settle_in_flight(STOP_GRACE_SECONDS)
+                return
+            startup.result()
+            if self.closed.is_set():
+                return
         except ApiError as exc:
             closed.cancel()
             _raise_lost_access(exc)
             raise
         except BaseException:
+            startup.cancel()
             closed.cancel()
             raise
         tasks = {
@@ -897,4 +978,4 @@ class Bridge:
             await asyncio.gather(*tasks, closed, return_exceptions=True)
             if self.closed.is_set():
                 # The hub kills the bridge 5 s after SIGTERM; finish the send first.
-                await self._settle_in_flight(4.0)
+                await self._settle_in_flight(STOP_GRACE_SECONDS)
