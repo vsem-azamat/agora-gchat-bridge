@@ -161,6 +161,7 @@ class Person:
     photo_url: str = ""
     rev: str = ""
     named: bool = False  # the name is the directory's, not a stand-in
+    failed: bool = False  # a stand-in because the lookup failed, not the directory's answer
 
 
 def person_from(user: str, data: dict[str, Any] | None) -> Person:
@@ -375,17 +376,20 @@ class Bridge:
         while len(self._thread_roots) > CACHE_LIMIT:
             self._thread_roots.popitem(last=False)
 
-    async def _person(self, user: str) -> Person:
+    async def _person(self, user: str, *, give_up: bool = True) -> Person:
         """A user's directory record, cached. A lookup Google refuses, or the
         PERSON_ATTEMPTS-th in a row without an answer, gives the stand-in
         `user <id>` for NAME_RETRY_SECONDS; before that, no answer raises, so
-        the message is read again after the reconnect."""
+        the message is read again after the reconnect. Without `give_up`, no
+        answer always raises and is not counted."""
         cached = self._people.get(user)
         if cached and time.monotonic() < cached[1]:
             return cached[0]
         try:
             person = person_from(user, await self.api.get_person(user))
         except TransportError as exc:
+            if not give_up:
+                raise
             failures = self._person_failures.get(user, 0) + 1
             self._person_failures[user] = failures
             if failures < PERSON_ATTEMPTS:
@@ -405,7 +409,7 @@ class Bridge:
         return person
 
     def _stand_in(self, user: str) -> Person:
-        person = Person(f"user {user_id(user)}")
+        person = Person(f"user {user_id(user)}", failed=True)
         self._people[user] = (person, time.monotonic() + NAME_RETRY_SECONDS)
         return person
 
@@ -415,28 +419,41 @@ class Bridge:
     async def _refresh_members(self) -> None:
         """Read the names to mention the space's members by, when
         MEMBERS_TTL_SECONDS have passed; the last known ones stay when reading
-        fails. Called outside the lock: reading every member's People record
-        can take seconds in a large space, and reads must not wait for it."""
+        fails, a member's name among them. Called outside the lock where it
+        can be: reading every member's People record can take seconds in a
+        large space, and reads must not wait for it."""
         if self._members_due is not None and time.monotonic() < self._members_due:
             return
         try:
-            members = await self.api.list_members(self.space)
-            people = {}
-            for membership in members:
-                member = membership.get("member") or {}
-                user = member.get("name")
-                if member.get("type") == "HUMAN" and isinstance(user, str):
-                    person = await self._person(user)
-                    if person.named:  # a stand-in such as "user 123" names no one
-                        people[user] = person.name
+            people = await self._read_members()
         except (ApiError, TransportError) as exc:
             # A message must not wait for its mentions: go on with the last
             # known members and try again a little later.
             log.warning("members not read: %s", short_reason(exc, 120))
+            people = None
+        if people is None:
             self._members_due = time.monotonic() + MEMBERS_RETRY_SECONDS
             return
         self._members = member_names(people)
         self._members_due = time.monotonic() + MEMBERS_TTL_SECONDS
+
+    async def _read_members(self) -> dict[str, str] | None:
+        """The space's human members the directory names, as users/ID → name;
+        None when a member's name could not be read. These lookups do not
+        count towards PERSON_ATTEMPTS: a reader gives up on a sender, the
+        members are kept as they were."""
+        people = {}
+        for membership in await self.api.list_members(self.space):
+            member = membership.get("member") or {}
+            user = member.get("name")
+            if member.get("type") == "HUMAN" and isinstance(user, str):
+                person = await self._person(user, give_up=False)
+                if person.failed:
+                    log.warning("members not read: name of %s not read", user_id(user))
+                    return None
+                if person.named:  # a stand-in such as "user 123" names no one
+                    people[user] = person.name
+        return people
 
     async def _names_for(self, msg: dict[str, Any]) -> dict[str, str]:
         """Display names of the users a message's text mentions."""
@@ -868,14 +885,14 @@ class Bridge:
         no further send."""
         if not self._resolved:
             await self._resolve_space()
-        if not self.outbox.empty():
-            await self._refresh_members()
         async with self._lock:
             if self.cursor is None:
                 await self._start_cursor()
             if self._job is not None:
                 await self._run_job(self._job)
             while not self.outbox.empty() and not self.closed.is_set():
+                # Under the lock: the loops that read have not started yet.
+                await self._refresh_members()
                 await self._process(self.outbox.get_nowait())
             if self.closed.is_set():
                 return

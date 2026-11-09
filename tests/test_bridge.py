@@ -859,13 +859,10 @@ async def test_sender_whose_name_keeps_failing_comes_in_as_a_stand_in(chat):
     await h.stop()
 
 
-async def test_a_stand_in_name_is_looked_up_again_later(chat):
+async def test_a_stand_in_name_is_looked_up_again_later(chat, monkeypatch):
     from gchat_bridge.bridge import PERSON_ATTEMPTS
 
-    def expire(user: str) -> None:
-        person, _ = h.bridge._people[user]
-        h.bridge._people[user] = (person, 0.0)
-
+    monkeypatch.setattr("gchat_bridge.bridge.NAME_RETRY_SECONDS", 0.1)
     h = await started(chat)
     chat.person_errors.extend([TransportError("People API 503")] * PERSON_ATTEMPTS)
     chat.add("first")
@@ -874,15 +871,51 @@ async def test_a_stand_in_name_is_looked_up_again_later(chat):
             await asyncio.wait_for(h.task, 2)
         h.start()
     await h.until(lambda: h.ins())
-    expire("users/200")
+    await asyncio.sleep(0.15)  # the stand-in runs out
     chat.person_errors.append(TransportError("still 503"))
     chat.add("second")  # no answer again: the stand-in stays, without a reconnect
     await h.until(lambda: len(h.ins()) == 2)
-    expire("users/200")
+    await asyncio.sleep(0.15)
     chat.add("third")  # an answer gives the name
     await h.until(lambda: len(h.ins()) == 3)
     assert [line["author"]["name"] for line in h.ins()] == ["user 200"] * 2 + ["Ada"]
     assert not h.task.done()
+    await h.stop()
+
+
+async def test_a_refused_lookup_is_looked_up_again_later(chat, monkeypatch):
+    monkeypatch.setattr("gchat_bridge.bridge.NAME_RETRY_SECONDS", 0.1)
+    h = await started(chat)
+    chat.person_errors.append(api_error(500, "backend"))
+    chat.add("first")
+    await h.until(lambda: h.ins())
+    await asyncio.sleep(0.15)
+    chat.add("second")
+    await h.until(lambda: len(h.ins()) == 2)
+    assert [line["author"]["name"] for line in h.ins()] == ["user 200", "Ada"]
+    await h.stop()
+
+
+async def test_an_answer_starts_the_count_of_failed_lookups_over(chat, monkeypatch):
+    from gchat_bridge.bridge import PERSON_ATTEMPTS
+
+    monkeypatch.setattr("gchat_bridge.bridge.NAME_TTL_SECONDS", 0.1)
+    h = await started(chat)
+    chat.person_errors.extend([TransportError("People API 503")] * (PERSON_ATTEMPTS - 1))
+    chat.add("first")
+    for _ in range(PERSON_ATTEMPTS - 1):
+        with pytest.raises(TransportError):
+            await asyncio.wait_for(h.task, 2)
+        h.start()
+    await h.until(lambda: h.ins())  # the next lookup answered
+    await asyncio.sleep(0.15)  # the name runs out
+    chat.person_errors.append(TransportError("People API 503"))
+    chat.add("second")
+    with pytest.raises(TransportError):  # one failure after an answer reconnects
+        await asyncio.wait_for(h.task, 2)
+    h.start()
+    await h.until(lambda: len(h.ins()) == 2)
+    assert [line["author"]["name"] for line in h.ins()] == ["Ada", "Ada"]
     await h.stop()
 
 
@@ -932,3 +965,88 @@ async def test_stopping_during_startup_bounds_the_send_in_flight(chat, monkeypat
     h.bridge.closed.set()
     await asyncio.wait_for(h.task, 1)
     assert asyncio.get_running_loop().time() - started_at < 0.5
+
+
+async def test_members_without_people_answers_keep_the_last_known_ones(chat):
+    from gchat_bridge.bridge import PERSON_ATTEMPTS
+
+    h = await started(chat)
+    h.out(90, "@Ada hi")
+    await h.until(lambda: h.of("sent"))
+    original = chat.get_person
+
+    async def no_answer_for_ada(user):
+        if user == "users/200":
+            raise TransportError("People API 503")
+        return await original(user)
+
+    chat.get_person = no_answer_for_ada
+    for n in range(1, PERSON_ATTEMPTS + 2):
+        h.bridge._members_due = 0.0  # a refresh is due
+        person, _ = h.bridge._people["users/200"][:2]
+        h.bridge._people["users/200"] = (person, 0.0)  # and Ada's name ran out
+        h.out(90 + n, "@Ada hi")
+        await h.until(lambda n=n: len(h.of("sent")) == n + 1)
+    assert all(text.endswith("<users/200> hi") for text in chat.texts())
+    await h.stop()
+
+
+async def test_a_readers_stand_in_does_not_drop_a_member(chat):
+    h = await started(chat)
+    h.out(95, "@Ada hi")
+    await h.until(lambda: h.of("sent"))
+    person, _ = h.bridge._people["users/200"][:2]
+    h.bridge._people["users/200"] = (person, 0.0)
+    chat.person_errors.append(api_error(500, "backend"))
+    chat.add("from Ada")  # the read caches a stand-in for Ada
+    await h.until(lambda: h.ins())
+    assert h.ins()[0]["author"]["name"] == "user 200"
+    h.bridge._members_due = 0.0
+    h.out(96, "@Ada again")
+    await h.until(lambda: len(h.of("sent")) == 2)
+    assert chat.texts()[-1] == "🤖 secretary: <users/200> again"
+    await h.stop()
+
+
+async def test_mentions_in_a_line_queued_during_the_first_start(chat):
+    gate = asyncio.Event()
+    original = chat.list_messages
+
+    async def slow_first_read(space, **kwargs):
+        if kwargs.get("newest_first"):
+            await gate.wait()
+        return await original(space, **kwargs)
+
+    chat.list_messages = slow_first_read
+    h = Harness(chat)
+    h.hello()  # no cursor: startup reads the newest message first
+    h.start()
+    await asyncio.sleep(0.05)  # startup waits for that read
+    h.out(98, "@Ada during")
+    gate.set()
+    await h.until(lambda: h.of("sent"))
+    assert chat.texts() == ["🤖 secretary: <users/200> during"]
+    await h.stop()
+
+
+async def test_member_refreshes_do_not_count_towards_giving_up_on_a_sender(chat):
+    from gchat_bridge.bridge import PERSON_ATTEMPTS
+
+    h = await started(chat)
+    h.out(100, "@Ada hi")
+    await h.until(lambda: h.of("sent"))
+    for n in range(1, PERSON_ATTEMPTS):  # refreshes that get no answer for Ada
+        person, _ = h.bridge._people["users/200"][:2]
+        h.bridge._people["users/200"] = (person, 0.0)
+        h.bridge._members_due = 0.0
+        chat.person_errors.append(TransportError("People API 503"))
+        h.out(100 + n, "@Ada hi")
+        await h.until(lambda n=n: len(h.of("sent")) == n + 1)
+    chat.person_errors.append(TransportError("People API 503"))
+    chat.add("from Ada")  # the reader's first failure still reconnects
+    with pytest.raises(TransportError):
+        await asyncio.wait_for(h.task, 2)
+    h.start()
+    await h.until(lambda: h.ins())
+    assert h.ins()[0]["author"]["name"] == "Ada"
+    await h.stop()
