@@ -26,6 +26,7 @@ MAX_BACKOFF_SECONDS = 30.0
 PAGE_SIZE = 100  # messages per page (Chat allows up to 1000; reads after a cursor are short)
 SPACES_PAGE_SIZE = 1000  # Chat's largest page of spaces and of members
 MAX_DOWNLOAD_BYTES = 1024 * 1024
+PHOTO_HOST_SUFFIX = ".googleusercontent.com"  # where the People API serves profile photos
 
 
 class ChatApi:
@@ -160,18 +161,43 @@ class ChatApi:
             raise
 
     async def download(self, url: str) -> bytes:
-        """A public image (a profile photo), at most MAX_DOWNLOAD_BYTES."""
+        """A public image (a profile photo) from Google's photo hosts, at most
+        MAX_DOWNLOAD_BYTES; the body is read only up to that cap."""
         try:
-            resp = await self._http.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+            parsed = httpx.URL(url)
+        except httpx.InvalidURL:
+            raise ApiError(400, "download: not a URL") from None
+        # raw_host is the ASCII form as sent; .host decodes IDNA and can raise.
+        host = parsed.raw_host.decode("ascii", "replace")
+        if parsed.scheme != "https" or not host.endswith(PHOTO_HOST_SUFFIX):
+            raise ApiError(400, f"download: host {host or '(none)'} is not a photo host")
+        try:
+            parsed.host  # noqa: B018 - httpx decodes it to send; bad IDNA raises
+        except ValueError:
+            raise ApiError(400, f"download: host {host} is not a valid name") from None
+        try:
+            async with self._http.stream(
+                "GET",
+                parsed,
+                # Uncompressed, so the cap bounds memory, not just bytes received.
+                headers={"Accept-Encoding": "identity"},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            ) as resp:
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    raise TransportError(f"download: HTTP {resp.status_code}")
+                if resp.status_code != 200:
+                    raise ApiError(resp.status_code, "download refused")
+                announced = resp.headers.get("Content-Length", "")
+                if announced.isdigit() and int(announced) > MAX_DOWNLOAD_BYTES:
+                    raise ApiError(413, "download too large")
+                body = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    body += chunk
+                    if len(body) > MAX_DOWNLOAD_BYTES:
+                        raise ApiError(413, "download too large")
         except httpx.HTTPError as exc:
             raise TransportError(f"download: {type(exc).__name__}") from exc
-        if resp.status_code >= 500 or resp.status_code == 429:
-            raise TransportError(f"download: HTTP {resp.status_code}")
-        if resp.status_code != 200:
-            raise ApiError(resp.status_code, "download refused")
-        if len(resp.content) > MAX_DOWNLOAD_BYTES:
-            raise ApiError(413, "download too large")
-        return resp.content
+        return bytes(body)
 
     # --- transport --------------------------------------------------------
 

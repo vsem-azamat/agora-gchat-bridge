@@ -10,7 +10,14 @@ from pathlib import Path
 
 import httpx
 
-from gchat_bridge.auth import SCOPES, AccessTokens, TokenFile, load_token_file, save_token_file
+from gchat_bridge.auth import (
+    SCOPES,
+    AccessTokens,
+    TokenFile,
+    load_token_file,
+    save_token_file,
+    scope_gaps,
+)
 from gchat_bridge.chat_api import PEOPLE_BASE, ChatApi
 from gchat_bridge.config import add_common_options, expand, file_defaults
 from gchat_bridge.errors import ApiError, AuthError, ConfigError, TransportError
@@ -76,6 +83,18 @@ def login(args: argparse.Namespace) -> int:
     if not creds.refresh_token:
         print("error: Google returned no refresh token", file=sys.stderr)
         return 1
+    fatal, lost = scope_gaps(creds.granted_scopes)
+    for scope, feature in fatal:
+        print(f"error: access not granted: {scope} ({feature})", file=sys.stderr)
+    if fatal:
+        print(
+            "error: the token was not saved; run `gchat-bridge login` again "
+            "and allow every access it asks for",
+            file=sys.stderr,
+        )
+        return 1
+    for scope, feature in lost:
+        print(f"warning: access not granted: {scope} ({feature})", file=sys.stderr)
     try:
         resp = httpx.get(
             f"{PEOPLE_BASE}/people/me",
@@ -105,6 +124,8 @@ def login(args: argparse.Namespace) -> int:
     print(f"Saved the token to {path} (mode 0600).")
     if token.email:
         print(f"Logged in as {token.email}.")
+    if lost:
+        print("Run `gchat-bridge login` again and allow every access to get it back.")
     return 0
 
 

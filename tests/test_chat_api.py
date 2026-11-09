@@ -193,13 +193,16 @@ async def test_person_asks_for_names_and_photos(api, google):
     assert google.chat_requests()[0].url.params["personFields"] == "names,photos"
 
 
+PHOTO = "https://lh3.googleusercontent.com/a/example=s160"
+
+
 async def test_download(api, google):
     google.chat += [httpx.Response(200, content=b"img"), error(403, "no"), error(503, "busy")]
-    assert await api.download("https://example.com/p=s160") == b"img"
+    assert await api.download(PHOTO) == b"img"
     with pytest.raises(ApiError):
-        await api.download("https://example.com/p=s160")
+        await api.download(PHOTO)
     with pytest.raises(TransportError):
-        await api.download("https://example.com/p=s160")
+        await api.download(PHOTO)
     assert "Authorization" not in google.chat_requests()[0].headers
 
 
@@ -208,10 +211,63 @@ async def test_download_over_the_cap_is_refused(api, google):
 
     google.chat.append(httpx.Response(200, content=b"0" * (MAX_DOWNLOAD_BYTES + 1)))
     with pytest.raises(ApiError):
-        await api.download("https://example.com/p=s160")
+        await api.download(PHOTO)
 
 
 async def test_download_rate_limited_is_a_transport_error(api, google):
     google.chat.append(error(429, "slow down"))
     with pytest.raises(TransportError):
-        await api.download("https://example.com/p=s160")
+        await api.download(PHOTO)
+
+
+class Chunks(httpx.AsyncByteStream):
+    """A body served in chunks, counting how many were read."""
+
+    def __init__(self, chunk: bytes, count: int) -> None:
+        self.chunk = chunk
+        self.count = count
+        self.read = 0
+
+    async def __aiter__(self):
+        for _ in range(self.count):
+            self.read += 1
+            yield self.chunk
+
+
+async def test_download_stops_reading_at_the_cap(api, google):
+    from gchat_bridge.chat_api import MAX_DOWNLOAD_BYTES
+
+    chunk = b"0" * 1024
+    body = Chunks(chunk, 10 * MAX_DOWNLOAD_BYTES // len(chunk))
+    google.chat.append(httpx.Response(200, stream=body))
+    with pytest.raises(ApiError):
+        await api.download(PHOTO)
+    assert body.read <= MAX_DOWNLOAD_BYTES // len(chunk) + 1
+
+
+async def test_download_larger_than_announced_cap_is_refused_unread(api, google):
+    from gchat_bridge.chat_api import MAX_DOWNLOAD_BYTES
+
+    body = Chunks(b"0", 1)
+    headers = {"Content-Length": str(MAX_DOWNLOAD_BYTES + 1)}
+    google.chat.append(httpx.Response(200, headers=headers, stream=body))
+    with pytest.raises(ApiError):
+        await api.download(PHOTO)
+    assert body.read == 0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/p=s160",
+        "http://lh3.googleusercontent.com/a/example=s160",
+        "https://googleusercontent.com.example.com/a=s160",
+        "https://evilgoogleusercontent.com/a=s160",
+        "https://xn--a.googleusercontent.com/a=s160",
+        "not a url",
+    ],
+)
+async def test_download_only_from_googles_photo_hosts(api, google, url):
+    with pytest.raises(ApiError):
+        await api.download(url)
+    assert google.chat_requests() == []

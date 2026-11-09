@@ -29,7 +29,7 @@ It opens Google's consent page and waits on a loopback port for the answer, then
 
 The scopes asked for: reading messages, creating messages, reading spaces and their members (`chat.messages.readonly`, `chat.messages.create`, `chat.spaces.readonly`, `chat.memberships.readonly`), names and photos in your directory (`directory.readonly`), and your own identity (`openid`, `email`, `profile`). The bridge cannot edit or delete messages or change spaces.
 
-Mentions need `chat.memberships.readonly`: with a token file granted without it, `@names` stay text until you run `gchat-bridge login` again.
+Google's consent page may let you untick some of these. `gchat-bridge login` checks what was granted against what it asked for. Without `chat.messages.readonly`, `chat.messages.create` or `chat.spaces.readonly` the bridge cannot run: login fails and writes no token file (an older one stays as it was). Without any other scope it saves the token and prints a warning per missing scope with what is lost: without `chat.memberships.readonly` `@names` stay text, without `directory.readonly` people show as `user <id>` without avatars. Run `gchat-bridge login` again and allow everything to get it back.
 
 Find the space you want to bridge:
 

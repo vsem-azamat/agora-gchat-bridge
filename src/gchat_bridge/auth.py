@@ -21,16 +21,46 @@ import httpx
 from gchat_bridge.errors import AuthError, ConfigError, TransportError
 
 TOKEN_URI = "https://oauth2.googleapis.com/token"
-SCOPES = (
-    "openid",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/chat.messages.readonly",
-    "https://www.googleapis.com/auth/chat.messages.create",
-    "https://www.googleapis.com/auth/chat.spaces.readonly",
-    "https://www.googleapis.com/auth/chat.memberships.readonly",
-    "https://www.googleapis.com/auth/directory.readonly",
-)
+_AUTH = "https://www.googleapis.com/auth/"
+# Every scope `gchat-bridge login` asks for: whether the bridge can run without
+# it, and what it loses then. Google's granular consent lets a person untick
+# some of them.
+SCOPE_FEATURES: dict[str, tuple[bool, str]] = {
+    "openid": (False, "nothing the bridge uses"),
+    _AUTH + "userinfo.email": (False, "the login cannot show which account it is"),
+    _AUTH + "userinfo.profile": (False, "nothing the bridge uses"),
+    _AUTH + "chat.messages.readonly": (True, "the bridge cannot read the space"),
+    _AUTH + "chat.messages.create": (True, "the bridge cannot send to the space"),
+    _AUTH + "chat.spaces.readonly": (True, "the bridge cannot read what kind of space it is"),
+    _AUTH + "chat.memberships.readonly": (
+        False,
+        "agents cannot mention members: @names stay text",
+    ),
+    _AUTH + "directory.readonly": (
+        False,
+        "people show as `user <id>`, without their names and avatars",
+    ),
+}
+SCOPES = tuple(SCOPE_FEATURES)
+
+
+def scope_gaps(
+    granted: str | list[str] | tuple[str, ...] | None,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """The scopes asked for but not granted, as (scope, what is lost): those
+    the bridge cannot run without, then the others. A grant Google did not
+    report (None) is taken as complete."""
+    if granted is None:
+        return [], []
+    have = set(granted.split() if isinstance(granted, str) else granted)
+    fatal: list[tuple[str, str]] = []
+    lost: list[tuple[str, str]] = []
+    for scope, (required, feature) in SCOPE_FEATURES.items():
+        if scope not in have:
+            (fatal if required else lost).append((scope, feature))
+    return fatal, lost
+
+
 EXPIRY_MARGIN_SECONDS = 60.0  # refresh this long before Google's expiry
 REFRESH_TIMEOUT_SECONDS = 15.0
 
