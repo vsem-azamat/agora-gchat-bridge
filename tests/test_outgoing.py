@@ -85,3 +85,22 @@ def test_person_without_photos_is_unknown_not_none():
 def test_link_text_with_spaces_and_angle_brackets():
     assert chat_markup("[two words](https://x.org/)") == "<https://x.org/|two words>"
     assert chat_markup("[a < b](https://x.org/)") == "[a < b](https://x.org/)"
+
+
+def test_bold_italic_nests_bold_outside_italic():
+    assert chat_markup("***both*** and **b**") == "*_both_* and *b*"
+
+
+def test_unclosed_fence_leaves_the_rest_as_code():
+    text = "**b**\n```\n*x* and **y** and @Ada"
+    assert chat_markup(text) == "*b*\n```\n*x* and **y** and @Ada"
+    assert mention_markup(text, {"Ada": "users/1"}) == text
+
+
+def test_mentions_fold_case_like_the_name_table():
+    members = member_names({"users/1": "Jürgen Straße", "users/2": "Ada"})
+    assert mention_markup("@JÜRGEN STRASSE, hi", members) == "<users/1>, hi"
+    assert mention_markup("@jürgen strasse", members) == "<users/1>"
+    assert mention_markup("@Jürgen Straßer", members) == "<users/1> Straßer"
+    assert mention_markup("@Strasse", {"Straße": "users/3"}) == "<users/3>"
+    assert mention_markup("@Straße", {"Strasse": "users/3"}) == "<users/3>"

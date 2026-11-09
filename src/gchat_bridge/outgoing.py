@@ -1,13 +1,15 @@
 """An agent's text to Chat's: Markdown to Chat's formatting, @names to mentions.
 
-Code spans and blocks are left as they are; Chat shows them the same way.
+Code spans and blocks are left as they are; Chat shows them the same way. A
+block whose closing fence is missing runs to the end of the text.
 """
 
 from __future__ import annotations
 
 import re
 
-_CODE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
+_CODE = re.compile(r"```.*?(?:```|\Z)|`[^`\n]+`", re.DOTALL)
+_BOLD_ITALIC = re.compile(r"\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*")
 _BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _ITALIC = re.compile(r"(?<![*\w])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![*\w])")
 _STRIKE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~")
@@ -15,6 +17,9 @@ _STRIKE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~")
 _LINK = re.compile(r"\[([^\]\n]+)\]\((https?://(?:[^()\s]|\([^()\s]*\))+)\)")
 # What a mention must not touch besides code: URLs and Chat's own <…> markup.
 _NO_MENTION = re.compile(r"<[^<>\n]*>|https?://\S+")
+# Where a mention may start: an @ that does not follow a word or another @.
+_MENTION_AT = re.compile(r"(?<![\w@])@")
+_WORD_CHAR = re.compile(r"\w")
 _HEADING = re.compile(r"^#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", re.MULTILINE)
 _BOLD_MARK = "\x00"  # stands for Chat's bold `*` while italics are converted
 
@@ -41,6 +46,7 @@ def _link(match: re.Match[str]) -> str:
 
 def _markdown(text: str) -> str:
     text = _HEADING.sub(lambda m: f"{_BOLD_MARK}{m.group(1)}{_BOLD_MARK}", text)
+    text = _BOLD_ITALIC.sub(lambda m: f"{_BOLD_MARK}_{m.group(1)}_{_BOLD_MARK}", text)
     text = _BOLD.sub(lambda m: f"{_BOLD_MARK}{m.group(1)}{_BOLD_MARK}", text)
     text = _ITALIC.sub(r"_\1_", text)
     text = _STRIKE.sub(r"~\1~", text)
@@ -50,43 +56,59 @@ def _markdown(text: str) -> str:
 
 def chat_markup(text: str) -> str:
     """Markdown as Chat writes it: `**b**` and headings as `*b*`, `*i*` as
-    `_i_`, `~~s~~` as `~s~`, `[text](url)` as `<url|text>`."""
+    `_i_`, `***bi***` as `*_bi_*`, `~~s~~` as `~s~`, `[text](url)` as `<url|text>`."""
     return _outside_code(text, _markdown)
+
+
+def _fold(name: str) -> str:
+    """A name as mentions and the name table compare it: case folded, so
+    `STRASSE` and `Straße` are the same name."""
+    return name.casefold()
 
 
 def mention_markup(text: str, members: dict[str, str]) -> str:
     """`@Name` as Chat's `<users/ID>` for the members of the space, given as
-    name → users/ID (names compared without case). Longer names go first, so
+    name → users/ID (names compared case folded). Longer names go first, so
     `@Ada Lovelace` wins over `@Ada`; a name must end at a word boundary.
     Code, URLs and Chat's `<…>` markup are left alone."""
-    if not members:
+    by_fold = {_fold(name): user for name, user in members.items() if name.strip()}
+    if not by_fold:
         return text
-    by_lower = {name.lower(): user for name, user in members.items() if name.strip()}
-    names = sorted(by_lower, key=len, reverse=True)
-    pattern = re.compile(
-        r"(?<![\w@])@(" + "|".join(re.escape(n) for n in names) + r")(?!\w)", re.IGNORECASE
-    )
+    # Folding never shortens text, so a name is at most this many characters.
+    longest = max(len(name) for name in by_fold)
 
-    def user_for(found: str) -> str | None:
-        user = by_lower.get(found.lower())
-        if user is None:  # case folding the regex does but lower() does not (İ)
-            user = next(
-                (u for n, u in by_lower.items() if re.fullmatch(re.escape(n), found, re.I)), None
-            )
-        return user
+    def mention_at(chunk: str, start: int) -> tuple[str, int] | None:
+        """The member mentioned by the name at `start` and where it ends."""
+        for end in range(min(len(chunk), start + longest), start, -1):
+            if end < len(chunk) and _WORD_CHAR.match(chunk, end):
+                continue
+            user = by_fold.get(_fold(chunk[start:end]))
+            if user:
+                return user, end
+        return None
 
-    def replace(match: re.Match[str]) -> str:
-        user = user_for(match.group(1))
-        return f"<{user}>" if user else match.group(0)
+    def convert_plain(chunk: str) -> str:
+        parts: list[str] = []
+        last = 0
+        for at in _MENTION_AT.finditer(chunk):
+            if at.start() < last:
+                continue
+            found = mention_at(chunk, at.end())
+            if found:
+                parts.append(chunk[last : at.start()])
+                parts.append(f"<{found[0]}>")
+                last = found[1]
+        parts.append(chunk[last:])
+        return "".join(parts)
 
     def convert(chunk: str) -> str:
         parts: list[str] = []
         last = 0
         for skip in _NO_MENTION.finditer(chunk):
-            parts.append(pattern.sub(replace, chunk[last : skip.start()]))
+            parts.append(convert_plain(chunk[last : skip.start()]))
             parts.append(skip.group(0))
             last = skip.end()
-        parts.append(pattern.sub(replace, chunk[last:]))
+        parts.append(convert_plain(chunk[last:]))
         return "".join(parts)
 
     return _outside_code(text, convert)
@@ -103,15 +125,15 @@ def member_names(people: dict[str, str]) -> dict[str, str]:
             continue
         names[name] = user
         first = name.split(" ", 1)[0]
-        firsts.setdefault(first.casefold(), set()).add(user)
-    full = {n.casefold() for n in names}
+        firsts.setdefault(_fold(first), set()).add(user)
+    full = {_fold(n) for n in names}
     for user, name in people.items():
         first = " ".join(name.split()).split(" ", 1)[0] if name.strip() else ""
-        if first and len(firsts[first.casefold()]) == 1 and first.casefold() not in full:
+        if first and len(firsts[_fold(first)]) == 1 and _fold(first) not in full:
             names[first] = user
     # A full name two members share names neither.
     counts: dict[str, int] = {}
     for name in people.values():
-        key = " ".join(name.split()).casefold()
+        key = _fold(" ".join(name.split()))
         counts[key] = counts.get(key, 0) + 1
-    return {n: u for n, u in names.items() if counts.get(n.casefold(), 1) <= 1}
+    return {n: u for n, u in names.items() if counts.get(_fold(n), 1) <= 1}
