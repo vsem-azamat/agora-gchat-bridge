@@ -1,14 +1,15 @@
 """An agent's text to Chat's: Markdown to Chat's formatting, @names to mentions.
 
 Code spans and blocks are left as they are; Chat shows them the same way. A
-block whose closing fence is missing runs to the end of the text.
+fence at the start of a line with no closing fence runs to the end of the text;
+a lone ``` inside a line is text.
 """
 
 from __future__ import annotations
 
 import re
 
-_CODE = re.compile(r"```.*?(?:```|\Z)|`[^`\n]+`", re.DOTALL)
+_CODE = re.compile(r"```.*?```|^[ \t]*```.*\Z|`[^`\n]+`", re.DOTALL | re.MULTILINE)
 _BOLD_ITALIC = re.compile(r"\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*")
 _BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _ITALIC = re.compile(r"(?<![*\w])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![*\w])")

@@ -97,6 +97,13 @@ def test_unclosed_fence_leaves_the_rest_as_code():
     assert mention_markup(text, {"Ada": "users/1"}) == text
 
 
+def test_lone_backticks_mid_line_are_text():
+    members = {"Ada": "users/1"}
+    assert mention_markup("use ``` to fence, @Ada", members) == "use ``` to fence, <users/1>"
+    assert mention_markup("@Ada ``` @Ada", members) == "<users/1> ``` <users/1>"
+    assert chat_markup("`a` ``` **b**") == "`a` ``` *b*"
+
+
 def test_mentions_fold_case_like_the_name_table():
     members = member_names({"users/1": "Jürgen Straße", "users/2": "Ada"})
     assert mention_markup("@JÜRGEN STRASSE, hi", members) == "<users/1>, hi"
