@@ -1129,3 +1129,43 @@ async def test_members_that_could_not_be_listed_are_read_again_sooner(chat, monk
     await h.until(lambda: len(h.of("sent")) == 2)
     assert chat.texts() == ["🤖 secretary: @Ada one", "🤖 secretary: <users/200> two"]
     await h.stop()
+
+
+async def test_members_stop_looking_up_names_at_the_first_lookup_without_an_answer(chat):
+    chat.members = [f"users/{1000 + n}" for n in range(20)]
+    lookups = []
+
+    async def down(user):
+        lookups.append(user)
+        raise TransportError("People API 503")
+
+    chat.get_person = down
+    h = await started(chat)
+    h.out(120, "hi")
+    await h.until(lambda: h.of("sent"))
+    assert len(lookups) == 1
+    assert chat.texts() == ["🤖 secretary: hi"]
+    await h.stop()
+
+
+async def test_members_whose_names_are_all_refused_are_read_again_sooner(chat, monkeypatch):
+    monkeypatch.setattr("gchat_bridge.bridge.MEMBERS_RETRY_SECONDS", 0.05)
+    monkeypatch.setattr("gchat_bridge.bridge.NAME_RETRY_SECONDS", 0.05)
+    original = chat.get_person
+    refusing = [True]
+
+    async def refused_for_now(user):
+        if refusing[0]:
+            raise ApiError(400, "bad")
+        return await original(user)
+
+    chat.get_person = refused_for_now
+    h = await started(chat)
+    h.out(121, "@Ada one")
+    await h.until(lambda: h.of("sent"))
+    refusing[0] = False
+    await asyncio.sleep(0.1)  # MEMBERS_RETRY_SECONDS, well before MEMBERS_TTL_SECONDS
+    h.out(122, "@Ada two")
+    await h.until(lambda: len(h.of("sent")) == 2)
+    assert chat.texts() == ["🤖 secretary: @Ada one", "🤖 secretary: <users/200> two"]
+    await h.stop()

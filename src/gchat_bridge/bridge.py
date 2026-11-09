@@ -440,22 +440,28 @@ class Bridge:
 
     async def _read_members(self) -> tuple[dict[str, str], bool]:
         """The space's human members the directory names, as users/ID → name,
-        and whether any member's name was read. A member whose name cannot
-        be read keeps the name last read for them, or is left out. These
+        and whether the names were read: False when no member's name was, or
+        when a lookup got no answer. A member whose name cannot be read keeps
+        the name last read for them, or is left out. After a lookup without
+        an answer no further name is looked up: each one would wait through
+        the client's retries, and the send waits for the refresh. These
         lookups do not count towards PERSON_ATTEMPTS: a reader gives up on a
         sender, a member keeps their last known name."""
         people: dict[str, str] = {}
         humans = failed = 0
+        unanswered = False
         for membership in await self.api.list_members(self.space):
             member = membership.get("member") or {}
             user = member.get("name")
             if member.get("type") != "HUMAN" or not isinstance(user, str):
                 continue
             humans += 1
-            try:
-                person: Person | None = await self._person(user, give_up=False)
-            except TransportError:
-                person = None
+            person: Person | None = None
+            if not unanswered:
+                try:
+                    person = await self._person(user, give_up=False)
+                except TransportError:
+                    unanswered = True
             if person is None or person.failed:
                 failed += 1
                 if user in self._member_people:
@@ -464,7 +470,7 @@ class Bridge:
                 people[user] = person.name
         if failed:
             log.warning("members: %d of %d names not read; last known ones kept", failed, humans)
-        return people, failed < humans or not humans
+        return people, not unanswered and (failed < humans or not humans)
 
     async def _names_for(self, msg: dict[str, Any]) -> dict[str, str]:
         """Display names of the users a message's text mentions."""
